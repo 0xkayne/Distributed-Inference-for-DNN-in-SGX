@@ -27,16 +27,87 @@ using defer = shared_ptr<void>;
 
 
 ChunkPool::ChunkPool(int size_pool_, int num_byte_chunk_):
-    size_pool(size_pool_), num_byte_chunk(num_byte_chunk_)
+    size_pool(size_pool_), num_byte_chunk(num_byte_chunk_), reserved_base(nullptr), use_edmm(false)
 {
-    for (int i = 0; i < size_pool; i++) {
-        void* enc_chunk = (void*)memalign(64, num_byte_chunk);
-        chunks.push_back(enc_chunk);
-        chunk_ids.push(i);
+    // Initialize committed status vector
+    committed.resize(size_pool, false);
+    
+#ifdef USE_SGX
+    // Try to use EDMM if available
+    auto& edmm_mgr = EdmmManager::getInstance();
+    if (EdmmManager::is_edmm_available()) {
+        // Calculate total size needed (aligned to page boundary)
+        size_t total_size = (size_t)size_pool * (size_t)num_byte_chunk;
+        
+        // Reserve memory region using EDMM
+        reserved_base = edmm_mgr.reserve_memory(total_size);
+        
+        if (reserved_base != nullptr) {
+            use_edmm = true;
+            #ifdef PRINT_CHUNK_INFO
+                printf("ChunkPool: Using EDMM with reserved base %p\n", reserved_base);
+                printf("Pool size %d, num_byte_chunk %d, total: %lu bytes\n", 
+                       size_pool, num_byte_chunk, total_size);
+            #endif
+            
+            // Initialize chunk pointers (offsets from base)
+            for (int i = 0; i < size_pool; i++) {
+                void* chunk_addr = (char*)reserved_base + ((size_t)i * (size_t)num_byte_chunk);
+                chunks.push_back(chunk_addr);
+                chunk_ids.push(i);
+            }
+        } else {
+            #ifdef PRINT_CHUNK_INFO
+                printf("ChunkPool: EDMM reserve failed, falling back to memalign\n");
+            #endif
+            use_edmm = false;
+        }
     }
-    #ifdef PRINT_CHUNK_INFO
-        printf("Pool size %d, num_byte_chunk %d\n", size_pool, num_byte_chunk);
-    #endif
+#endif
+
+    // Fallback to traditional memalign if EDMM not available or failed
+    if (!use_edmm) {
+        #ifdef PRINT_CHUNK_INFO
+            printf("ChunkPool: Using traditional memalign\n");
+            printf("Pool size %d, num_byte_chunk %d\n", size_pool, num_byte_chunk);
+        #endif
+        
+        for (int i = 0; i < size_pool; i++) {
+            void* enc_chunk = (void*)memalign(64, num_byte_chunk);
+            chunks.push_back(enc_chunk);
+            chunk_ids.push(i);
+        }
+    }
+}
+
+ChunkPool::~ChunkPool() {
+    if (use_edmm && reserved_base != nullptr) {
+#ifdef USE_SGX
+        auto& edmm_mgr = EdmmManager::getInstance();
+        
+        // Decommit all committed pages before freeing
+        for (int i = 0; i < size_pool; i++) {
+            if (committed[i]) {
+                void* chunk_addr = chunks[i];
+                edmm_mgr.decommit_pages(chunk_addr, num_byte_chunk);
+            }
+        }
+        
+        // Free reserved memory
+        edmm_mgr.free_reserved_memory(reserved_base);
+        
+        #ifdef PRINT_CHUNK_INFO
+            printf("ChunkPool: Released EDMM reserved memory\n");
+        #endif
+#endif
+    } else {
+        // Free traditional malloc'd chunks
+        for (void* chunk : chunks) {
+            if (chunk != nullptr) {
+                free(chunk);
+            }
+        }
+    }
 }
 
 int ChunkPool::get_chunk_id() {
@@ -48,12 +119,54 @@ int ChunkPool::get_chunk_id() {
     int res;
     res = chunk_ids.top();
     chunk_ids.pop();
+    
+    // If using EDMM and chunk not yet committed, commit it now
+    if (use_edmm && !committed[res]) {
+#ifdef USE_SGX
+        auto& edmm_mgr = EdmmManager::getInstance();
+        void* chunk_addr = chunks[res];
+        
+        if (edmm_mgr.commit_pages(chunk_addr, num_byte_chunk)) {
+            committed[res] = true;
+            #ifdef PRINT_CHUNK_INFO
+                printf("ChunkPool: Committed chunk %d at %p (%d bytes)\n", 
+                       res, chunk_addr, num_byte_chunk);
+            #endif
+        } else {
+            // Commit failed, put the chunk back
+            chunk_ids.push(res);
+            lock.unlock();
+            printf("ERROR: Failed to commit EDMM pages for chunk %d\n", res);
+            throw std::runtime_error("Failed to commit EDMM pages");
+        }
+#endif
+    }
+    
     return res;
 }
 
 void ChunkPool::return_chunk_id(int id) {
     std::unique_lock<std::mutex> lock(stack_mutex);
     chunk_ids.push(id);
+    
+    // For EDMM, we could optionally decommit pages here to save EPC
+    // For now, we keep them committed for performance (lazy decommit)
+    // Uncomment below to enable aggressive decommit on return
+    /*
+    if (use_edmm && committed[id]) {
+#ifdef USE_SGX
+        auto& edmm_mgr = EdmmManager::getInstance();
+        void* chunk_addr = chunks[id];
+        
+        if (edmm_mgr.decommit_pages(chunk_addr, num_byte_chunk)) {
+            committed[id] = false;
+            #ifdef PRINT_CHUNK_INFO
+                printf("ChunkPool: Decommitted chunk %d at %p\n", id, chunk_addr);
+            #endif
+        }
+#endif
+    }
+    */
 }
 
 

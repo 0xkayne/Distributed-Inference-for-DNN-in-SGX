@@ -1,16 +1,21 @@
 <!-- Please refer to User's Guide for the explanation of each field -->
 <EnclaveConfiguration>
   <ProdID>0</ProdID>
-  <ISVSVN>0</ISVSVN>
-<!--  <StackMaxSize>0x20000000</StackMaxSize>-->
-  <StackMaxSize>0x2000000</StackMaxSize>
-<!--  <HeapMaxSize>0x99000000</HeapMaxSize>-->
-<!--  <HeapMaxSize>0x280000000</HeapMaxSize> -->
-  <HeapMaxSize>0x8000000</HeapMaxSize>
-<!--  <HeapMaxSize>0x8000000</HeapMaxSize>-->
+  <ISVSVN>1</ISVSVN>
+  
+  <!-- Stack Configuration (SGX2 EDMM) -->
+  <StackMaxSize>0x2000000</StackMaxSize>        <!-- 32MB max stack -->
+  
+  <!-- Heap Configuration for EDMM - increased for dynamic allocation -->
+  <HeapMaxSize>0x40000000</HeapMaxSize>         <!-- 1GB max heap for EDMM -->
+  
+  <!-- Thread Control Structure -->
   <TCSNum>4</TCSNum>
   <TCSPolicy>1</TCSPolicy>
   <DisableDebug>0</DisableDebug>
-  <MiscSelect>0</MiscSelect>
-  <MiscMask>0xFFFFFFFF</MiscMask>
+  
+  <!-- Misc Select and Mask - for SGX2 EDMM features -->
+  <!-- Set MiscSelect[0]=1 and MiscMask[0]=0 to enable dynamic features -->
+  <MiscSelect>1</MiscSelect>
+  <MiscMask>0xFFFFFFFE</MiscMask>
 </EnclaveConfiguration>

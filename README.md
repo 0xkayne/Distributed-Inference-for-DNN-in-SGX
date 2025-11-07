@@ -66,27 +66,78 @@ If you found this code helpful for your research, please cite our paper:
 - [2. How to run](#2-how-to-run)
 - [4. Customize Your Model](#4-customize-your-model)
 - [5. Code Structure](#5-code-structure)
-- [6. Disclaimer](#6-disclaimer)
-- [7. Acknowledgement](#7-acknowledgement)
+- [6. Troubleshooting SGX2 EDMM](#6-troubleshooting)
+- [7. Disclaimer](#7-disclaimer)
+- [8. Acknowledgement](#8-acknowledgement)
 
 
 ##  1. <a name='HowtoInstall'></a>How to Install
 
-1. Install Intel's [linux-sgx](https://github.com/intel/linux-sgx) and [linux-sgx-driver](https://github.com/intel/linux-sgx-driver).
-    We tested our code on SGX SDK 2.15 To test if your hardware supports SGX, you can use this [repo](https://github.com/ayeks/SGX-hardware). To check if SGX SDK is correctly installed, you can check if `/dev/isgx` exists by running `ls /dev/isgx`. You can also run the sample code in SGX SDK to test if SGX is correctly installed.
+### SGX2 EDMM Requirements
 
-    
-1. Install PyTorch with Python3. You may install it using [Anaconda](https://www.anaconda.com/)
+**⚠️ IMPORTANT**: This version of TAOISM uses SGX2 EDMM (Enclave Dynamic Memory Management) features for improved memory efficiency. You need:
 
-        conda create -n taoism python=3.7
-        conda install pytorch==1.7.0 torchvision==0.8.0 torchaudio==0.7.0 cudatoolkit=11.0 -c pytorch
+- **Hardware**: Intel CPU with SGX2 support (Ice Lake or newer)
+- **Driver**: Intel SGX DCAP driver >= 1.41 (provides `/dev/sgx_enclave` and `/dev/sgx_provision`)
+- **SDK**: Intel SGX SDK >= 2.19 with EDMM API support
 
-        
-2. Make the C++ part of this repo
+### Installation Steps
 
-        make
+1. **Install Intel SGX DCAP Driver and SDK**
 
-NOTE: Currently the compilation's `SGX_MODE` is set to `HW`, which means the code can only run on a machine with SGX hardware. If you want to run the code on a machine without SGX hardware, you can compile in the simulation mode by changing the `SGX_MODE` to `SIM` in the Makefile. 
+   For SGX2 EDMM support, install the DCAP driver and SDK 2.19+:
+   
+   ```bash
+   # Install DCAP driver (Ubuntu example)
+   wget https://download.01.org/intel-sgx/latest/linux-latest/distro/ubuntu20.04-server/sgx_linux_x64_driver_*.bin
+   chmod +x sgx_linux_x64_driver_*.bin
+   sudo ./sgx_linux_x64_driver_*.bin
+   
+   # Verify driver installation
+   ls -l /dev/sgx_enclave /dev/sgx_provision
+   
+   # Install SGX SDK 2.19 or newer
+   # Follow instructions at: https://github.com/intel/linux-sgx
+   ```
+
+2. **Check SGX2/EDMM Support**
+
+   Before building, verify your hardware and software support EDMM:
+   
+   ```bash
+   # Run the hardware capability check script
+   bash scripts/check_sgx2_edmm.sh
+   
+   # Or use the Makefile target
+   make check-edmm
+   ```
+   
+   The script will verify:
+   - CPU has SGX2 with Flexible Launch Control (FLC)
+   - DCAP driver devices exist (`/dev/sgx_enclave`, `/dev/sgx_provision`)
+   - SGX SDK version >= 2.19
+   - EDMM API headers are available
+
+3. **Install PyTorch with Python3**
+
+   You may install it using [Anaconda](https://www.anaconda.com/)
+
+   ```bash
+   conda create -n taoism python=3.7
+   conda install pytorch==1.7.0 torchvision==0.8.0 torchaudio==0.7.0 cudatoolkit=11.0 -c pytorch
+   ```
+
+4. **Build the C++ part of this repo**
+
+   ```bash
+   # Source SGX SDK environment
+   source /opt/intel/sgxsdk/environment
+   
+   # Build with SGX2 EDMM support
+   make clean && make
+   ```
+
+**NOTE**: The compilation's `SGX_MODE` is set to `HW` for SGX2 hardware mode. EDMM features are **not available** in simulation mode (`SGX_MODE=SIM`). You must have SGX2-capable hardware to use EDMM. 
 
 
 ##  2. <a name='Howtorun'></a>How to run
@@ -260,12 +311,91 @@ We summarize the code structure and the functionality of major files/directories
 
 ```
 
-##  6. <a name='Disclaimer'></a>Disclaimer
+##  6. <a name='Troubleshooting'></a>Troubleshooting SGX2 EDMM
+
+### Common Issues and Solutions
+
+#### 1. "Failed to create enclave" error
+
+**Symptoms**: Enclave initialization fails with SGX error codes.
+
+**Solutions**:
+- Verify SGX2 is enabled in BIOS settings
+- Check driver installation: `ls -l /dev/sgx_enclave`
+- Run capability check: `bash scripts/check_sgx2_edmm.sh`
+- Ensure no other enclaves are consuming all EPC memory
+
+#### 2. "EDMM features not detected" warning
+
+**Symptoms**: Warning message about EDMM not being available despite successful enclave creation.
+
+**Solutions**:
+- Your CPU may support SGX but not SGX2/EDMM
+- Check CPU specifications for SGX2 support (Ice Lake or newer)
+- Verify SDK version >= 2.19: `cat $SGX_SDK/version`
+- Enclave will fall back to static memory allocation (still functional)
+
+#### 3. "Out of EPC memory" errors
+
+**Symptoms**: Runtime errors about EPC exhaustion, especially with large models.
+
+**Solutions**:
+- Adjust `HeapMaxSize` and `ReservedMemMaxSize` in `Enclave/Enclave.config.xml`
+- Reduce `STORE_CHUNK_ELEM` in `Include/common_with_enclaves.h`
+- Enable aggressive decommit in `SGXDNN/chunk_manager.cpp` (see comments)
+- Close other SGX applications to free EPC
+
+#### 4. Compilation errors with sgx_create_enclave_ex
+
+**Symptoms**: Undefined reference to `sgx_create_enclave_ex` or related symbols.
+
+**Solutions**:
+- Update SGX SDK to version 2.19 or higher
+- Check that `$SGX_SDK/lib64` contains updated libraries
+- Re-source the SGX environment: `source $SGX_SDK/environment`
+- Clean and rebuild: `make clean && make`
+
+#### 5. Performance degradation compared to SGX1
+
+**Symptoms**: Slower inference times after EDMM migration.
+
+**Solutions**:
+- EDMM page commits have overhead; adjust chunk sizes
+- Enable lazy decommit (keep pages committed, default behavior)
+- Profile EPC page faults: `sudo perf stat -e sgx:*`
+- Consider pre-committing frequently used chunks
+
+#### 6. Legacy driver (/dev/isgx) detected
+
+**Symptoms**: Check script warns about old driver.
+
+**Solutions**:
+- Uninstall old driver: `sudo rmmod isgx`
+- Install DCAP driver following Intel's latest instructions
+- Reboot system after driver update
+- Verify new devices: `ls -l /dev/sgx_*`
+
+### Monitoring EDMM Performance
+
+To monitor EDMM memory usage during inference:
+
+```bash
+# Enable EDMM statistics printing
+export PRINT_CHUNK_INFO=1
+
+# Run your model
+python teeslice/eval_sgx_teeslice.py
+
+# Check kernel logs for EPC events
+sudo dmesg | grep -i sgx
+```
+
+##  7. <a name='Disclaimer'></a>Disclaimer
 DO NOT USE THIS SOFTWARE TO SECURE ANY REAL-WORLD DATA OR COMPUTATION!
 
 This software is a proof-of-concept meant for performance testing of the TAOISM framework ONLY. It is full of security vulnerabilities that facilitate testing, debugging and performance measurements. In any real-world deployment, these vulnerabilities can be easily exploited to leak all user inputs.
 
 Some parts that have a negligble impact on performance but that are required for a real-world deployment are not currently implemented (e.g., setting up a secure communication channel with a remote client and producing verifiable attestations).
 
-##  7. <a name='Acknowledgement'></a>Acknowledgement
+##  8. <a name='Acknowledgement'></a>Acknowledgement
 The framework is based on the code of Goten (Lucien K. L. Ng, 2021) and Slalom (Tramer & Boneh, 2019).

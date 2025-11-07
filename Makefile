@@ -1,12 +1,14 @@
 ######## SGX SDK Settings ########
 
-SGX_SDK ?= /home/zhangziqi/sgx-2.15/sgxsdk
+SGX_SDK ?= /opt/intel/sgxsdk
 
+# SGX2 EDMM mode - requires hardware support
 SGX_MODE ?= HW
 SGX_ARCH ?= x64
 SGX_DEBUG ?= 0
 SGX_PRERELEASE ?= 1
 
+# For simulation mode (no EDMM support):
 # SGX_MODE ?= SIM
 # SGX_ARCH ?= x64
 # SGX_DEBUG ?= 1
@@ -68,7 +70,7 @@ else
         App_C_Flags += -DNDEBUG -UEDEBUG -UDEBUG
 endif
 
-App_Cpp_Flags_WithoutSGX := $(App_C_Flags) -std=c++11 -shared 
+App_Cpp_Flags_WithoutSGX := $(App_C_Flags) -std=c++11 
 App_Cpp_Flags := $(App_Cpp_Flags_WithoutSGX) -DUSE_SGX
 App_Link_Flags := $(SGX_COMMON_CFLAGS) -L$(SGX_LIBRARY_PATH) -l$(Urts_Library_Name) -L$(TF_LIB) -pthread -fopenmp
 
@@ -98,7 +100,8 @@ SGXDNN_Cpp_Files := sgxdnn_main.cpp chunk_manager.cpp secret_tensor.cpp xoshiro.
 SGXDNN_Layer_Cpp_Files := layers/batchnorm.cpp layers/linear.cpp layers/conv.cpp layers/maxpool.cpp
 #SGXDNN_Cpp_Files += aesni_ghash.cpp aesni_key.cpp  aesni-wrap.cpp
 Enclave_Include_Paths := -IEnclave -I$(SGX_SDK)/include -I$(SGX_SDK)/include/tlibc -I$(SGX_SDK)/include/libcxx
-Enclave_Include_Paths += -IInclude -ISGXDNN -IInclude/eigen3_sgx -I/usr/lib/gcc/x86_64-linux-gnu/7.5.0/include
+GCC_INCLUDE_PATH := $(shell $(CC) -print-file-name=include)
+Enclave_Include_Paths += -IInclude -ISGXDNN -IInclude/eigen3_sgx -I$(GCC_INCLUDE_PATH)
 
 CC_BELOW_4_9 := $(shell expr "`$(CC) -dumpversion`" \< "4.9")
 ifeq ($(CC_BELOW_4_9), 1)
@@ -153,7 +156,17 @@ endif
 endif
 
 
-.PHONY: all run
+.PHONY: all run check-edmm
+
+# Check SGX2 EDMM hardware support before building
+check-edmm:
+	@echo "Checking SGX2 EDMM support..."
+	@if [ -x scripts/check_sgx2_edmm.sh ]; then \
+		bash scripts/check_sgx2_edmm.sh; \
+	else \
+		echo "Warning: scripts/check_sgx2_edmm.sh not found or not executable"; \
+		echo "Skipping EDMM capability check"; \
+	fi
 
 ifeq ($(Build_Mode), HW_RELEASE)
 all: .config_$(Build_Mode)_$(SGX_ARCH) $(App_Name) $(Enclave_Name)
@@ -195,29 +208,29 @@ App/bin/Enclave_u.o: App/Enclave_u.c
 	@echo "CC   <=  $<"
 
 App/bin/aes_stream_common.o: App/aes_stream_common.cpp
-	$(CXX) $(App_Cpp_Flags_WithoutSGX) App/aes_stream_common.cpp -o $@ $(App_Link_Flags)
+	$(CXX) $(App_Cpp_Flags_WithoutSGX) -c App/aes_stream_common.cpp -o $@
 	@echo "CXX  <=  $<"
 
 App/bin/sgxaes_common.o: App/sgxaes_common.cpp SGXDNN/bin_sgx/sgxaes_asm.o 
-	$(CXX) $(App_Cpp_Flags_WithoutSGX) App/sgxaes_common.cpp -o $@ SGXDNN/bin_sgx/sgxaes_asm.o $(App_Link_Flags)
+	$(CXX) $(App_Cpp_Flags_WithoutSGX) -c App/sgxaes_common.cpp -o $@
 	@echo "CXX  <=  $<"
 
 App/bin/randpool_common.o: App/randpool_common.cpp App/bin/aes_stream_common.o 
-	$(CXX) $(App_Cpp_Flags_WithoutSGX) App/randpool_common.cpp -o $@ App/bin/aes_stream_common.o $(App_Link_Flags)
+	$(CXX) $(App_Cpp_Flags_WithoutSGX) -c App/randpool_common.cpp -o $@
 	@echo "CXX  <=  $<"
 
 App/bin/common_utils.o: App/common_utils.cpp
-	$(CXX) $(App_Cpp_Flags_WithoutSGX) App/randpool_common.cpp -o $@ $(App_Link_Flags)
+	$(CXX) $(App_Cpp_Flags_WithoutSGX) -c App/common_utils.cpp -o $@
 	@echo "CXX  <=  $<"
 
 
 App/bin/crypto_common.o: App/crypto_common.cpp App/bin/sgxaes_common.o
-	$(CXX) $(App_Cpp_Flags_WithoutSGX) App/crypto_common.cpp -o $@ App/bin/sgxaes_common.o $(App_Link_Flags)
+	$(CXX) $(App_Cpp_Flags_WithoutSGX) -c App/crypto_common.cpp -o $@
 	@echo "CXX  <=  $<"
 
-App/bin/enclave_bridge.so: App/enclave_bridge.cpp App/bin/Enclave_u.o App/bin/aes_stream_common.o App/bin/crypto_common.o App/bin/randpool_common.o App/bin/common_utils.o
-	$(CXX) $(App_Cpp_Flags) App/enclave_bridge.cpp -o $@ \
-		App/bin/Enclave_u.o App/bin/aes_stream_common.o App/bin/sgxaes_common.o App/bin/crypto_common.o App/bin/randpool_common.o App/bin/common_utils.o \
+App/bin/enclave_bridge.so: App/enclave_bridge.cpp App/bin/Enclave_u.o App/bin/aes_stream_common.o App/bin/crypto_common.o App/bin/randpool_common.o App/bin/common_utils.o SGXDNN/bin_sgx/sgxaes_asm.o
+	$(CXX) $(App_Cpp_Flags) -shared App/enclave_bridge.cpp -o $@ \
+		App/bin/Enclave_u.o App/bin/aes_stream_common.o App/bin/sgxaes_common.o App/bin/crypto_common.o App/bin/randpool_common.o App/bin/common_utils.o SGXDNN/bin_sgx/sgxaes_asm.o \
 		$(App_Link_Flags)
 	@echo "CXX  <=  $<"
 

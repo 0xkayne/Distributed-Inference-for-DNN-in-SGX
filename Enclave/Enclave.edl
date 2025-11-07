@@ -96,5 +96,16 @@ enclave {
         double ocall_get_time();
         void ocall_end_clock([in, string] const char *str);
         void* ocall_allocate_mem(int num_byte);
+        
+        /* EDMM statistics OCALL */
+        void ocall_print_edmm_stats(
+            uint64_t total_alloc,
+            uint64_t total_commit,
+            uint64_t total_decommit,
+            uint64_t bytes_reserved,
+            uint64_t bytes_committed,
+            uint64_t current_committed,
+            uint64_t peak_committed
+        );
     };
 };

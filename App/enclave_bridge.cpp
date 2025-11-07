@@ -21,7 +21,7 @@
 #include "Enclave_u.h"
 
 #include "common_with_enclaves.h"
-#include "common_utils.cpp"
+#include "common_utils.h"
 #include "crypto_common.h"
 #include "ThreadPool.h"
 
@@ -205,6 +205,29 @@ double ocall_get_time()
 	return time_point_cast<microseconds>(now).time_since_epoch().count();
 }
 
+/* EDMM Statistics OCALL */
+void ocall_print_edmm_stats(
+    uint64_t total_alloc,
+    uint64_t total_commit,
+    uint64_t total_decommit,
+    uint64_t bytes_reserved,
+    uint64_t bytes_committed,
+    uint64_t current_committed,
+    uint64_t peak_committed)
+{
+    printf("\n");
+    printf("=== EDMM Statistics (from Enclave) ===\n");
+    printf("Total reserve calls:      %lu\n", total_alloc);
+    printf("Total commit calls:       %lu\n", total_commit);
+    printf("Total decommit calls:     %lu\n", total_decommit);
+    printf("Total bytes reserved:     %lu (%.2f MB)\n", bytes_reserved, bytes_reserved / (1024.0 * 1024.0));
+    printf("Total bytes committed:    %lu (%.2f MB)\n", bytes_committed, bytes_committed / (1024.0 * 1024.0));
+    printf("Current bytes committed:  %lu (%.2f MB)\n", current_committed, current_committed / (1024.0 * 1024.0));
+    printf("Peak bytes committed:     %lu (%.2f MB)\n", peak_committed, peak_committed / (1024.0 * 1024.0));
+    printf("======================================\n");
+    printf("\n");
+}
+
 void* ocall_allocate_mem(int num_byte) {
     void* res = (void*)malloc(num_byte);
     return res;
@@ -303,28 +326,43 @@ extern "C"
 {
 
 /*
- * Initialize the enclave
+ * Initialize the enclave with SGX2 EDMM support
  */
     uint64_t initialize_enclave(void)
     {
 
-        std::cout << "Initializing Enclave..." << std::endl;
-        printf("My enclave init");
+        std::cout << "Initializing Enclave with SGX2 EDMM support..." << std::endl;
+        printf("My enclave init (SGX2 mode)\n");
 
         sgx_enclave_id_t eid = 0;
         sgx_launch_token_t token = {0};
         sgx_status_t ret = SGX_ERROR_UNEXPECTED;
         int updated = 0;
+        sgx_misc_attribute_t misc_attr;
+        memset(&misc_attr, 0, sizeof(misc_attr));
 
-        /* call sgx_create_enclave to initialize an enclave instance */
-        /* Debug Support: set 2nd parameter to 1 */
-        ret = sgx_create_enclave(ENCLAVE_FILENAME, SGX_DEBUG_FLAG, &token, &updated, &eid, NULL);
+        /* Use standard sgx_create_enclave for better compatibility */
+        ret = sgx_create_enclave(ENCLAVE_FILENAME, SGX_DEBUG_FLAG, &token, &updated, &eid, &misc_attr);
+        
         if (ret != SGX_SUCCESS) {
             print_error_message(ret);
+            printf("Failed to create enclave. Ensure SGX2 is enabled in BIOS and drivers are installed.\n");
             throw ret;
         }
 
-        std::cout << "Enclave id: " << eid << std::endl;
+        std::cout << "Enclave created successfully with id: " << eid << std::endl;
+        
+        // Check EDMM support in misc_select
+        #ifdef MISC_EXINFO
+        if (misc_attr.misc_select & MISC_EXINFO) {
+            printf("✓ SGX2 EDMM features detected and enabled\n");
+        } else {
+            printf("⚠ Warning: EDMM features not detected in misc_select (0x%x)\n", misc_attr.misc_select);
+            printf("  Enclave may fall back to static memory allocation\n");
+        }
+        #else
+        printf("Note: Unable to verify EDMM support (MISC_EXINFO not defined)\n");
+        #endif
 
         return eid;
     }

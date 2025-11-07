@@ -7,6 +7,7 @@
 // #include "utils.hpp"
 
 #include "common_with_enclaves.h"
+#include "sgx_edmm_wrapper.h"
 
 #include <unsupported/Eigen/CXX11/Tensor>
 #include <Eigen/Core>
@@ -22,6 +23,7 @@
 #include <cstdlib>
 #include <mutex>
 #include <stack>
+#include <vector>
 #include <time.h>
 #include "Crypto.h"
 #include <omp.h>
@@ -34,6 +36,7 @@ using std::shared_ptr;
 class ChunkPool {
 public:
     ChunkPool(int size_pool_, int num_byte_chunk_);
+    ~ChunkPool();
 
     int get_chunk_id();
 
@@ -46,6 +49,11 @@ private:
     int num_byte_chunk;
     std::mutex stack_mutex;
     std::stack<int> chunk_ids;
+    
+    // EDMM support
+    void* reserved_base;           // Base address of reserved memory region
+    std::vector<bool> committed;   // Track which chunks are committed
+    bool use_edmm;                 // Whether to use EDMM or fallback to memalign
 };
 
 
