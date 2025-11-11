@@ -10,6 +10,8 @@ echo " ResNet SGX2 EDMM 测试"
 echo "========================================="
 echo ""
 
+# 激活 conda 环境
+conda activate taoism
 # 设置 SGX 环境
 echo "[1] 设置 SGX 环境..."
 source /opt/intel/sgxsdk/environment
