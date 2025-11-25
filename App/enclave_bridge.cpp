@@ -367,7 +367,7 @@ extern "C"
 #endif
         
         if (ret != SGX_SUCCESS) {
-            print_error_message(ret);
+            print_error_message(ret, __func__);
             printf("Failed to create enclave. Ensure SGX2 is enabled in BIOS and drivers are installed.\n");
             throw ret;
         }
@@ -406,33 +406,37 @@ extern "C"
     void InitTensor(EidT eid, IdT TenId, int dim0, int dim1, int dim2, int dim3) {
         DimsT Dims = CreateDims(dim0, dim1, dim2, dim3);
         sgx_status_t ret = ecall_init_tensor(eid, TenId, (void*) &Dims);
-        if (ret != SGX_SUCCESS) { print_error_message(ret); throw ret; }
+        if (ret != SGX_SUCCESS) { print_error_message(ret, __func__); throw ret; }
     }
 
     void SetTen(EidT eid, IdT TenId, DtypeForCpuOp* Arr) {
         sgx_status_t ret = ecall_set_ten(eid, TenId, (void*) Arr);
-        if (ret != SGX_SUCCESS) { print_error_message(ret); throw ret; }
+        if (ret != SGX_SUCCESS) {
+            fprintf(stderr, "[SetTen] Failed for tensor tag=%llu\n", static_cast<unsigned long long>(TenId));
+            print_error_message(ret, __func__);
+            throw ret;
+        }
     }
 
     void GetTen(EidT eid, IdT TenId, DtypeForCpuOp* Arr) {
         sgx_status_t ret = ecall_get_ten(eid, TenId, (void*) Arr);
-        if (ret != SGX_SUCCESS) { print_error_message(ret); throw ret; }
+        if (ret != SGX_SUCCESS) { print_error_message(ret, __func__); throw ret; }
     }
 
     void SetSeed(EidT eid, IdT TenId, uint64_t RawSeed) {
         sgx_status_t ret = ecall_set_seed(eid, TenId, RawSeed);
-        if (ret != SGX_SUCCESS) { print_error_message(ret); throw ret; }
+        if (ret != SGX_SUCCESS) { print_error_message(ret, __func__); throw ret; }
     }
 
     void GetRandom(EidT eid, IdT TenId, DtypeForCpuOp* Arr, uint64_t RawSeed) {
         sgx_status_t ret = ecall_get_random(eid, TenId, (void*) Arr, RawSeed);
-        if (ret != SGX_SUCCESS) { print_error_message(ret); throw ret; }
+        if (ret != SGX_SUCCESS) { print_error_message(ret, __func__); throw ret; }
     }
 
 
     void AddFromCpu(EidT eid, void* inputArr, IdT dstId) {
         sgx_status_t ret = ecall_add_from_cpu(eid, inputArr, dstId);
-        if (ret != SGX_SUCCESS) { print_error_message(ret); throw ret; }
+        if (ret != SGX_SUCCESS) { print_error_message(ret, __func__); throw ret; }
     }
 
     TaskIdT AsyncAddFromCpu(EidT eid, void* inputArr, IdT dstId) {
@@ -488,7 +492,7 @@ extern "C"
             DtypeForCpuOp dampening, bool nesterov, bool first_momentum) {
         sgx_status_t ret = ecall_sgd_update(eid, paramId, gradId, momentumId,
                 lr, momentum, weight_decay, dampening, nesterov, first_momentum);
-        if (ret != SGX_SUCCESS) { print_error_message(ret); throw ret; }
+        if (ret != SGX_SUCCESS) { print_error_message(ret, __func__); throw ret; }
     }
 
     TaskIdT AsyncSgdUpdate(EidT eid, IdT paramId, IdT gradId, IdT momentumId,
@@ -502,7 +506,7 @@ extern "C"
 
     void StochasticQuantize(EidT eid, IdT src_id, IdT dst_id, uint64_t q_tag) {
         sgx_status_t ret = ecall_stochastic_quantize(eid, src_id, dst_id, q_tag);
-        if (ret != SGX_SUCCESS) { print_error_message(ret); throw ret; }
+        if (ret != SGX_SUCCESS) { print_error_message(ret, __func__); throw ret; }
     }
 
     TaskIdT AsyncStochasticQuantize(EidT eid, IdT src_id, IdT dst_id, uint64_t q_tag) {
@@ -515,17 +519,17 @@ extern "C"
     
     void ReLUfunction(EidT eid, IdT TenIdin, IdT TenIdout, uint64_t size){
         sgx_status_t ret = ecall_relu(eid, TenIdin, TenIdout, size);
-        if (ret != SGX_SUCCESS) { print_error_message(ret); throw ret; }
+        if (ret != SGX_SUCCESS) { print_error_message(ret, __func__); throw ret; }
     }
 
     void QuantReLUfunction(EidT eid, IdT TenIdin, IdT TenIdout, uint64_t size, float scale, float v_min, uint8_t zero){
         sgx_status_t ret = ecall_quant_relu(eid, TenIdin, TenIdout, size, scale, v_min, zero);
-        if (ret != SGX_SUCCESS) { print_error_message(ret); throw ret; }
+        if (ret != SGX_SUCCESS) { print_error_message(ret, __func__); throw ret; }
     }
 
     void ReLUbackward(EidT eid, IdT TenIdout, IdT TenIddout, IdT TenIddin, uint64_t size){
         sgx_status_t ret = ecall_reluback(eid, TenIdout, TenIddout, TenIddin, size);
-        if (ret != SGX_SUCCESS) { print_error_message(ret); throw ret; }
+        if (ret != SGX_SUCCESS) { print_error_message(ret, __func__); throw ret; }
     }
 
 
@@ -544,25 +548,25 @@ extern "C"
 
         // results.emplace_back( pool.enqueue([&] {
         //     sgx_status_t ret = ecall_get_share(eid, TenId1, (void*) Arr1, RawSeed1);
-        //     if (ret != SGX_SUCCESS) { print_error_message(ret); throw ret; }
+        //     if (ret != SGX_SUCCESS) { print_error_message(ret, __func__); throw ret; }
         //     return 1;
         // }));
 
         // results.emplace_back( pool.enqueue([&] {
         //     sgx_status_t ret = ecall_get_share(eid, TenId2, (void*) Arr2, RawSeed2);
-        //     if (ret != SGX_SUCCESS) { print_error_message(ret); throw ret; }
+        //     if (ret != SGX_SUCCESS) { print_error_message(ret, __func__); throw ret; }
         //     return 2;
         // }));
 
         // results.emplace_back( pool.enqueue([&] {
         //     sgx_status_t ret = ecall_get_share(eid, TenId3, (void*) Arr3, RawSeed3);
-        //     if (ret != SGX_SUCCESS) { print_error_message(ret); throw ret; }
+        //     if (ret != SGX_SUCCESS) { print_error_message(ret, __func__); throw ret; }
         //     return 3;
         // }));
 
         // results.emplace_back( pool.enqueue([&] {
         //     sgx_status_t ret = ecall_get_share(eid, TenId4, (void*) Arr4, RawSeed4);
-        //     if (ret != SGX_SUCCESS) { print_error_message(ret); throw ret; }
+        //     if (ret != SGX_SUCCESS) { print_error_message(ret, __func__); throw ret; }
         //     return 4;
         // }));
 
@@ -572,17 +576,17 @@ extern "C"
 
     void InitMaxpool(EidT eid, IdT FunId, IdT TenIdin_trans, IdT TenIdout_trans){
         sgx_status_t ret = ecall_initmaxpool(eid, FunId, TenIdin_trans, TenIdout_trans);      
-        if (ret != SGX_SUCCESS) { print_error_message(ret); throw ret; }
+        if (ret != SGX_SUCCESS) { print_error_message(ret, __func__); throw ret; }
     }
 
     void Maxpoolfunction(EidT eid, IdT FunId, IdT TenIdin, IdT TenIdout, uint32_t batch, uint32_t channel, uint32_t input_height, uint32_t input_width, uint32_t output_height, uint32_t output_width, uint32_t filter_height, uint32_t filter_width, uint32_t row_stride,uint32_t col_stride, uint32_t row_pad, uint32_t col_pad){
         sgx_status_t ret = ecall_maxpool(eid, FunId, TenIdin, TenIdout, batch, channel, input_height, input_width, output_height, output_width, filter_height, filter_width, row_stride, col_stride, row_pad, col_pad);
-        if (ret != SGX_SUCCESS) { print_error_message(ret); throw ret; }
+        if (ret != SGX_SUCCESS) { print_error_message(ret, __func__); throw ret; }
     }
 
     void Maxpoolbackwardfunction(EidT eid, IdT FunId, IdT TenIddout, IdT TenIddin, uint32_t batch, uint32_t channel, uint32_t input_height, uint32_t input_width, uint32_t output_height, uint32_t output_width, uint32_t filter_height, uint32_t filter_width, uint32_t row_stride,uint32_t col_stride){
         sgx_status_t ret = ecall_maxpoolback(eid, FunId, TenIddout, TenIddin, batch, channel, input_height, input_width, output_height, output_width, filter_height, filter_width, row_stride, col_stride);
-        if (ret != SGX_SUCCESS) { print_error_message(ret); throw ret; }
+        if (ret != SGX_SUCCESS) { print_error_message(ret, __func__); throw ret; }
     }
 
     void InitBatchnorm(
@@ -602,17 +606,17 @@ extern "C"
                 mu,
                 batch_, channel_, height_, width_,
                 affine_, is_cumulative_, momentum_, epsilon_);
-        if (ret != SGX_SUCCESS) { print_error_message(ret); throw ret; }
+        if (ret != SGX_SUCCESS) { print_error_message(ret, __func__); throw ret; }
     }
 
     void BatchnormForward(EidT eid, uint64_t FunId, int Training) {
         sgx_status_t ret = ecall_batchnorm_forward(eid, FunId, Training);
-        if (ret != SGX_SUCCESS) { print_error_message(ret); throw ret; }
+        if (ret != SGX_SUCCESS) { print_error_message(ret, __func__); throw ret; }
     }
 
     void BatchnormBackward(EidT eid, uint64_t FunId) {
         sgx_status_t ret = ecall_batchnorm_backward(eid, FunId);
-        if (ret != SGX_SUCCESS) { print_error_message(ret); throw ret; }
+        if (ret != SGX_SUCCESS) { print_error_message(ret, __func__); throw ret; }
     }
 
     void InitSGXLinear(
@@ -628,12 +632,12 @@ extern "C"
                 input, output, weight, bias,
                 // der_input, der_output, der_weight, der_bias,
                 batch_, input_size_, output_size_);
-        if (ret != SGX_SUCCESS) { print_error_message(ret); throw ret; }
+        if (ret != SGX_SUCCESS) { print_error_message(ret, __func__); throw ret; }
     }
 
     void SGXLinearForward(EidT eid, uint64_t FunId) {
         sgx_status_t ret = ecall_sgx_linear_forward(eid, FunId);
-        if (ret != SGX_SUCCESS) { print_error_message(ret); throw ret; }
+        if (ret != SGX_SUCCESS) { print_error_message(ret, __func__); throw ret; }
     }
 
     void InitSGXConv(
@@ -654,12 +658,12 @@ extern "C"
                 batch_, input_h, input_w, input_c, 
                 output_h, output_w, output_c,
                 kernel, padding, stride);
-        if (ret != SGX_SUCCESS) { print_error_message(ret); throw ret; }
+        if (ret != SGX_SUCCESS) { print_error_message(ret, __func__); throw ret; }
     }
 
     void SGXConvForward(EidT eid, uint64_t FunId) {
         sgx_status_t ret = ecall_sgx_conv_forward(eid, FunId);
-        if (ret != SGX_SUCCESS) { print_error_message(ret); throw ret; }
+        if (ret != SGX_SUCCESS) { print_error_message(ret, __func__); throw ret; }
     }
 }
 

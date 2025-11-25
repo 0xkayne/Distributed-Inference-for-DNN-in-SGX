@@ -54,6 +54,10 @@ void SecretTen::GetStoreChunk(int start, DtypeForCpuOp* store_chunk, int num_byt
 
 void SecretTen::SetTen(DtypeForCpuOp* Arr) {
     auto& chunk_manager = TrustedChunkManager::getInstance();
+    if (ChunkIds.empty()) {
+        // Lazily initialize storage if the tensor was not initialized yet.
+        Init();
+    }
     auto chunk_op = [&](int start, int num_elem_in_op) {
         int chunk_id = GetChunkId(start);
         DtypeForCpuOp* src_arr = Arr + start;

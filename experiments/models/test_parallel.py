@@ -80,6 +80,7 @@ class SecretParallelToyNet:
         self.model_name = "ParallelToyNet"
 
     def _build_layers(self):
+        self._layers = []
         sid = self.sid
         mode = self.enclave_mode
         pool_mode = self._resolve_mode(
@@ -87,16 +88,20 @@ class SecretParallelToyNet:
             ExecutionModeOptions.CPU if mode is ExecutionModeOptions.Enclave else mode,
         )
 
-        # Layer A: input (source tensor provider)
-        layer_a = SecretInputLayer(
-            sid,
-            "LayerA",
-            self.input_shape,
-            self._resolve_mode("LayerA", mode),
-            manually_register_next=True,
+        def append(layer):
+            self._layers.append(layer)
+            return layer
+
+        layer_a = append(
+            SecretInputLayer(
+                sid,
+                "LayerA",
+                self.input_shape,
+                self._resolve_mode("LayerA", mode),
+                manually_register_next=True,
+            )
         )
 
-        # LayerA_Pool: lightweight spatial downsampling before entering enclave conv
         layer_a_pool = SecretMaxpool2dLayer(
             sid,
             "LayerA_Pool",
@@ -108,22 +113,8 @@ class SecretParallelToyNet:
             manually_register_next=True,
         )
         layer_a_pool.register_prev_layer(layer_a)
+        append(layer_a_pool)
 
-        # Bridge layer to move CPU pool output back into enclave memory when needed
-        bridge_mode = self._resolve_mode(
-            "LayerA_Pool_Bridge",
-            ExecutionModeOptions.Enclave if mode is ExecutionModeOptions.Enclave else mode,
-        )
-        layer_pool_bridge = SecretIdentityLayer(
-            sid,
-            "LayerA_Pool_Bridge",
-            bridge_mode,
-            manually_register_prev=True,
-            manually_register_next=True,
-        )
-        layer_pool_bridge.register_prev_layer(layer_a_pool)
-
-        # Layer B: first learnable feature extractor (3x3 conv)
         layer_b = SGXConvBase(
             sid,
             "LayerB",
@@ -135,9 +126,9 @@ class SecretParallelToyNet:
             manually_register_prev=True,
             manually_register_next=True,
         )
-        layer_b.register_prev_layer(layer_pool_bridge)
+        layer_b.register_prev_layer(self._ensure_mode(layer_a_pool, layer_b, "LayerB"))
+        append(layer_b)
 
-        # Non-linear activation before feeding LayerC
         layer_b_relu = SecretReLULayer(
             sid,
             "LayerB_ReLU",
@@ -146,8 +137,8 @@ class SecretParallelToyNet:
             manually_register_next=True,
         )
         layer_b_relu.register_prev_layer(layer_b)
+        append(layer_b_relu)
 
-        # Layer C: second convolution preserving spatial resolution
         layer_c = SGXConvBase(
             sid,
             "LayerC",
@@ -160,8 +151,8 @@ class SecretParallelToyNet:
             manually_register_next=True,
         )
         layer_c.register_prev_layer(layer_b_relu)
+        append(layer_c)
 
-        # Layer D: host-side branch placeholder fed directly by LayerB output
         layer_d = SecretIdentityLayer(
             sid,
             "LayerD",
@@ -169,9 +160,9 @@ class SecretParallelToyNet:
             manually_register_prev=True,
             manually_register_next=True,
         )
-        layer_d.register_prev_layer(layer_b)
+        layer_d.register_prev_layer(self._ensure_mode(layer_b, layer_d, "LayerD"))
+        append(layer_d)
 
-        # Layer E: merge enclave (LayerC) and host (LayerD) branches
         layer_e = SecretAddLayer(
             sid,
             "LayerE",
@@ -179,10 +170,10 @@ class SecretParallelToyNet:
             manually_register_prev=True,
             manually_register_next=True,
         )
-        layer_e.register_prev_layer(layer_c)
-        layer_e.register_prev_layer(layer_d)
+        layer_e.register_prev_layer(self._ensure_mode(layer_c, layer_e, "LayerE_left"))
+        layer_e.register_prev_layer(self._ensure_mode(layer_d, layer_e, "LayerE_right"))
+        append(layer_e)
 
-        # Layer F: output, inference mode to skip loss computation
         layer_f = SecretOutputLayer(
             sid,
             "LayerF",
@@ -191,13 +182,11 @@ class SecretParallelToyNet:
             manually_register_prev=True,
         )
         layer_f.register_prev_layer(layer_e)
+        append(layer_f)
 
-        # Optional: keep a simple adjacency list for inspection without
-        # instantiating the heavy SecretNeuralNetwork object.
         self._connections = {
             "LayerA": ["LayerA_Pool"],
-            "LayerA_Pool": ["LayerA_Pool_Bridge"],
-            "LayerA_Pool_Bridge": ["LayerB"],
+            "LayerA_Pool": ["LayerB"],
             "LayerB": ["LayerB_ReLU", "LayerD"],
             "LayerB_ReLU": ["LayerC"],
             "LayerC": ["LayerE"],
@@ -206,17 +195,7 @@ class SecretParallelToyNet:
             "LayerF": [],
         }
 
-        ordered_layers: List = [
-            layer_a,
-            layer_a_pool,
-            layer_pool_bridge,
-            layer_b,
-            layer_b_relu,
-            layer_c,
-            layer_d,
-            layer_e,
-            layer_f,
-        ]
+        ordered_layers: List = list(self._layers)
 
         if self.active_layers is None:
             return ordered_layers
@@ -237,6 +216,26 @@ class SecretParallelToyNet:
                 print(f"  {layer_name} -> {', '.join(next_layers)}")
             else:
                 print(f"  {layer_name} -> <end>")
+
+    def _ensure_mode(
+        self,
+        prev_layer: SecretIdentityLayer,
+        next_layer: SecretIdentityLayer,
+        suffix: str,
+    ) -> SecretIdentityLayer:
+        if prev_layer.EnclaveMode is next_layer.EnclaveMode:
+            return prev_layer
+        bridge_name = f"{prev_layer.LayerName}_to_{suffix}"
+        bridge_layer = SecretIdentityLayer(
+            self.sid,
+            bridge_name,
+            next_layer.EnclaveMode,
+            manually_register_prev=True,
+            manually_register_next=True,
+        )
+        bridge_layer.register_prev_layer(prev_layer)
+        self._layers.append(bridge_layer)
+        return bridge_layer
 
     def _resolve_mode(
         self, layer_name: str, default_mode: ExecutionModeOptions
@@ -360,20 +359,23 @@ def test_parallel():
     warmup_runs = 1
     measured_runs = 3
 
+    # 每个配置项可以独立指定整个模型的执行域以及 per-layer override。
+    # 通过传入 `layer_mode_overrides`，即可针对任意层设置 CPU/Enclave/GPU，
+    # 例如将入口/出口放在 CPU，而中间卷积在 SGX 中执行。
     mode_configs = [
-        # {
-        #     "label": "Full CPU baseline",
-        #     "mode": ExecutionModeOptions.CPU,
-        #     "overrides": None,
-        # },
-        # To exercise the enclave branch, append an entry such as:
+        {
+            "label": "Full CPU baseline",
+            "mode": ExecutionModeOptions.CPU,
+            "overrides": None,
+        },
         {
             "label": "SGX core + CPU host branch",
             "mode": ExecutionModeOptions.Enclave,
             "overrides": {
-                "LayerD": ExecutionModeOptions.CPU,
-                "LayerE": ExecutionModeOptions.CPU,
-                "LayerF": ExecutionModeOptions.CPU,
+                "LayerA": ExecutionModeOptions.CPU,
+                "LayerB": ExecutionModeOptions.CPU,
+                "LayerC": ExecutionModeOptions.CPU,
+                # "LayerF": ExecutionModeOptions.CPU,
             },
         },
     ]

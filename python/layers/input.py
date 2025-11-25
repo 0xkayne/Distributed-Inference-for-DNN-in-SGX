@@ -1,5 +1,6 @@
 from python.layers.nonlinear import SecretNonlinearLayer
 from python.enclave_interfaces import GlobalTensor as gt
+from python.utils.basic_utils import ExecutionModeOptions
 from pdb import set_trace as st
 
 class SecretInputLayer(SecretNonlinearLayer):
@@ -20,7 +21,11 @@ class SecretInputLayer(SecretNonlinearLayer):
         return
 
     def set_input(self, tensor):
-        self.set_tensor_cpu_gpu_enclave("input", tensor)
+        self.set_cpu("input", tensor)
+        if self.EnclaveMode is ExecutionModeOptions.Enclave:
+            self.set_tensor("input", tensor)
+        if self.EnclaveMode is ExecutionModeOptions.GPU:
+            self.set_gpu("input", tensor)
 
     def get_output_shape(self):
         return self.shape

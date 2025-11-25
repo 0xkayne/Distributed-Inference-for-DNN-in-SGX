@@ -30,16 +30,6 @@ void MaxpoolBuffer::forward(
         printf("!!!!!!!!!!!!!!!!!!! STORE_CHUNK_ELEM %% inputhw != 0 !!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
         return;
     }
-    if (channel % 8 != 0){
-        printf("Channel (%d) % 8 should be 0, but channel is not!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
-        printf("Please change the form of AVX functions\n");
-        return;
-    }
-    //if (num_img_in_storechunk % 8 != 0){
-    //	printf("STORE_CHUNK_ELEM/inputhw is not divisible by 8!\n");
-    //	return;
-    //}
-
     const uint32_t radius_height = filter_height/2, radius_width = filter_width/2;
     const uint32_t outputhw = output_height * output_width;
     uint32_t outputsize_in_storechunk = num_img_in_storechunk * outputhw;
@@ -61,6 +51,9 @@ void MaxpoolBuffer::forward(
     auto chunk_op = [&](size_t start_chunk, size_t num_elem_in, size_t num_elem_out) {
         num_img_in_storechunk = num_elem_in / inputhw;
         size_of_store_chunk = num_elem_in * sizeof(float);
+        const bool use_sse_in = (num_img_in_storechunk % 4 == 0) && (inputhw % 4 == 0);
+        const bool use_sse_out = (num_img_in_storechunk % 4 == 0) && (outputhw % 4 == 0);
+        const size_t outputsize_local = num_img_in_storechunk * outputhw;
         // printf("maxpooling forward in enclave. start_chunk: %d, num_elem_in %d, num_elem_out %d\n", start_chunk, num_elem_in, num_elem_out);
         chunk_manager.GetChunk(ten_in->GetChunkId(start_chunk), chunk_in, num_elem_in * sizeof(DtypeForCpuOp));
         // printf("Input: h=%d, w=%d\n", input_height, input_width);
@@ -71,8 +64,11 @@ void MaxpoolBuffer::forward(
         //     printf("\n");
         // }
         // printf("transpose inputhw %d, num_img_in_storechunk %d \n", inputhw, num_img_in_storechunk);
-        transpose_block_SSE4x4(chunk_in, chunk_in_trans, inputhw, num_img_in_storechunk, 8);
-        // transpose(chunk_in, chunk_in_trans, num_img_in_storechunk, inputhw);
+        if (use_sse_in) {
+            transpose_block_SSE4x4(chunk_in, chunk_in_trans, inputhw, num_img_in_storechunk, 8);
+        } else {
+            transpose(chunk_in, chunk_in_trans, num_img_in_storechunk, inputhw);
+        }
         // Save transpose chunk have problem when STORE_CHUNK_ELEM=1204224, channel=1024, imghw=8
         // chunk_manager.StoreChunk(ten_in_trans->GetChunkId(start_chunk), chunk_in_trans, size_of_store_chunk);
         // printf("Transpose input: h=%d, w=%d\n", input_height, input_width);
@@ -82,7 +78,7 @@ void MaxpoolBuffer::forward(
         //     }
         //     printf("\n");
         // }
-        fill(chunk_out_trans, chunk_out_trans + outputsize_in_storechunk, std::numeric_limits<DtypeForCpuOp>::lowest());
+        std::fill(chunk_out_trans, chunk_out_trans + outputsize_local, std::numeric_limits<DtypeForCpuOp>::lowest());
         for(uint32_t h = 0; h < input_height; ++h) {
             for(uint32_t w = 0; w < input_width; ++w) {
                 // (h_start, h_end) * (w_start, w_end) is the range that the input
@@ -130,7 +126,6 @@ void MaxpoolBuffer::forward(
                         //     ph, pw, in_offset, out_offset_base, out_offset
                         // );
                         
-                        // MaxpoolAVX(num_img_in_storechunk, chunk_in_trans+in_offset, chunk_out_trans + out_offset);
                         PlainMaxpool(num_img_in_storechunk, chunk_in_trans+in_offset, chunk_out_trans + out_offset);
                     }
                 }
@@ -147,10 +142,9 @@ void MaxpoolBuffer::forward(
         // }
         // printf("use SSE %d\n", if_use_SSE_out);
         //transpose
-        if(if_use_SSE_out){
+        if(use_sse_out){
             transpose_block_SSE4x4(chunk_out_trans, chunk_tmp, num_img_in_storechunk, outputhw, 8);
-        }
-        else{
+        } else {
             transpose(chunk_out_trans, chunk_tmp, outputhw, num_img_in_storechunk);
         }
         // transpose(chunk_out_trans, chunk_tmp, outputhw, num_img_in_storechunk);
