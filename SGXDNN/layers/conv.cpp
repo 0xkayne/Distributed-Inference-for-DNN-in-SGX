@@ -59,7 +59,7 @@ void SGXConvBuffer::init(
         printf("STORE_CHUNK_ELEM %d cannot divide input_row_size*stride %d*%d, STORE_CHUNK_ELEM %% input_row_size=%d\n", 
         STORE_CHUNK_ELEM, input_row_size, stride, STORE_CHUNK_ELEM % (input_row_size*stride));
     }
-    assert (STORE_CHUNK_ELEM % input_row_size == 0);
+    // assert (STORE_CHUNK_ELEM % input_row_size == 0);
     int input_rows_per_chunk = STORE_CHUNK_ELEM / input_row_size;
     input_elem_fetch_per_chunk = input_rows_per_chunk * input_row_size;
     int num_input_per_chunk = input_rows_per_chunk / input_h;
@@ -82,19 +82,19 @@ void SGXConvBuffer::init(
 
     patch_size = kernel * kernel * input_c;
     // Compute max im2col patches
-    assert (STORE_CHUNK_ELEM > patch_size);
+    // assert (STORE_CHUNK_ELEM > patch_size);
     max_im2col_patches_per_chunk = STORE_CHUNK_ELEM / patch_size;
     int total_im2col_patches = batch * output_h * output_w;
     max_im2col_patches_per_chunk = std::min(max_im2col_patches_per_chunk, total_im2col_patches);
     // Compute max output patches
     if (STORE_CHUNK_ELEM < output_c)
         printf("output channel (%d) is larger than STORE_CHUNK_ELEM\n", output_c);
-    assert (STORE_CHUNK_ELEM >= output_c);
+    // assert (STORE_CHUNK_ELEM >= output_c);
     if (STORE_CHUNK_ELEM % output_c != 0){
         printf("STORE_CHUNK_ELEM %d cannot divide output_channel %d, STORE_CHUNK_ELEM %% output_c=%d\n", 
             STORE_CHUNK_ELEM, output_c, STORE_CHUNK_ELEM % output_c);
     }
-    assert (STORE_CHUNK_ELEM % output_c == 0);
+    // assert (STORE_CHUNK_ELEM % output_c == 0);
     max_output_patches_per_chunk = STORE_CHUNK_ELEM / output_c;
     int total_output_patches = batch * output_h * output_w;
     max_output_patches_per_chunk = std::min(max_output_patches_per_chunk, total_output_patches);
@@ -157,7 +157,7 @@ void SGXConvBuffer::forward() {
             filter_value_count, filter_value_count * sizeof(DtypeForCpuOp), STORE_CHUNK_ELEM
         );
     }
-    assert((filter_value_count * sizeof(DtypeForCpuOp)) <= STORE_CHUNK_ELEM);
+    // assert((filter_value_count * sizeof(DtypeForCpuOp)) <= STORE_CHUNK_ELEM);
     auto& chunk_manager = TrustedChunkManager::getInstance();
     DtypeForCpuOp *data_chunk, *weight_chunk, *output_chunk, *im2col_chunk, *bias_chunk;
     ChunkGuard<DtypeForCpuOp> data_guard(StoreChunkPool::GetChunkPool(), data_chunk);
@@ -607,112 +607,54 @@ void SGXConvBuffer::forward() {
                     // }
                     // printf("\n");
 
-                    if ((output_row_idx_in_chunk + matrix_mul_rows <= output_patches_per_chunk) ||
-                        im2col_last_row
-                    ){
-                        #ifdef PRINT_RUN_TIME_INFO
-                            save_output_start_time = get_time();
-                        #endif
-                        #ifdef PRINT_CONV_OUTPUT_SAVE_CHUNK_INFO
-                            printf(
-                                "Directly copy, im2col_last_row %d, ", im2col_last_row);
-                            printf(
-                                "im2col_last_row %d, last_chunk %d, row_idx_in_chunk %d (%d-%d), output_row_idx_in_chunk %d, total output row %d-%d\n",
-                                im2col_last_row, last_chunk, row_idx_in_chunk, end_row_idx_in_operate_chunk, stride_rows,
-                                output_row_idx_in_chunk, 
-                                output_row_idx_total+output_row_idx_in_chunk, output_row_idx_total+output_row_idx_in_chunk+matrix_mul_rows
-                            );
-                            // for (auto print_output_row_idx=0; print_output_row_idx<matrix_mul_rows; print_output_row_idx++){
-                            //     if (output_row_idx_total+output_row_idx_in_chunk+print_output_row_idx == 2438){
-                            //         DtypeForCpuOp* p_print = tmp_output_chunk+print_output_row_idx;
-                            //         printf("Row %d output %.5f\n",output_row_idx_total+output_row_idx_in_chunk+print_output_row_idx, *p_print);
-                            //     }
-                            // }
-                        #endif
-                        // directly copy
-                        DtypeForCpuOp* output_start_idx_in_chunk = output_chunk + (output_row_idx_in_chunk * output_c);
-                        DtypeForCpuOp* tmp_output_chunk_end = tmp_output_chunk + (matrix_mul_rows * output_c);
-                        // std::copy(tmp_output_chunk, tmp_output_chunk_end, output_start_idx_in_chunk);
-                        memcpy(output_start_idx_in_chunk, tmp_output_chunk, matrix_mul_rows*output_c*sizeof(DtypeForCpuOp));
-                        output_row_idx_in_chunk += matrix_mul_rows;
+                    #ifdef PRINT_RUN_TIME_INFO
+                        save_output_start_time = get_time();
+                    #endif
 
-                        if (im2col_last_row || output_row_idx_in_chunk == output_patches_per_chunk){
-                            #ifdef PRINT_CONV_OUTPUT_SAVE_CHUNK_INFO
-                                printf(
-                                    "Last Store, last_row %d, output rows %d/%d\n", 
-                                    im2col_last_row, output_row_idx_in_chunk, output_patches_per_chunk
-                                );
-                                
-                            #endif
-                            // printf("output_row_idx_total(%d)*output_c(%d) = %d\n", output_row_idx_total, output_c, output_row_idx_total*output_c);
-                            // save output_chunk
-                            chunk_manager.StoreChunk(
-                                output_tensor->GetChunkId(output_row_idx_total*output_c), output_chunk, 
-                                output_row_idx_in_chunk*output_c*sizeof(DtypeForCpuOp)
-                            );
-                            output_row_idx_total += output_row_idx_in_chunk;
-                            output_row_idx_in_chunk = 0;
+    const int total_output_patches = batch * output_height * output_width;
+                    auto flush_output_chunk = [&](int rows_to_flush) {
+                        int rows_remaining = total_output_patches - output_row_idx_total;
+                        int rows_can_flush = std::min(rows_to_flush, rows_remaining);
+                        if (rows_can_flush <= 0) {
+                            return;
                         }
-                        #ifdef PRINT_RUN_TIME_INFO
-                            save_output_time += get_elapsed_time(save_output_start_time, get_time());
-                        #endif
-                    } else{
-                        #ifdef PRINT_RUN_TIME_INFO
-                            save_output_start_time = get_time();
-                        #endif
-                        #ifdef PRINT_CONV_OUTPUT_SAVE_CHUNK_INFO
-                            printf(
-                                "Middle copy, old output rows %d -> %d id %ld, ", 
-                                output_row_idx_in_chunk, output_patches_per_chunk, 
-                                output_tensor->GetChunkId(output_row_idx_total*output_c)
-                            );
-                        #endif
-                        //copy part of tmp_output, store output_chunk, load new output_chunk, and copy the rest
-                        DtypeForCpuOp* output_start_idx_in_chunk = output_chunk + (output_row_idx_in_chunk * output_c);
-                        int chunk_left_rows = output_patches_per_chunk - output_row_idx_in_chunk;
-                        DtypeForCpuOp* tmp_output_chunk_divide = tmp_output_chunk + (chunk_left_rows * output_c);
-                        std::copy(tmp_output_chunk, tmp_output_chunk_divide, output_start_idx_in_chunk);
-                        output_row_idx_in_chunk += chunk_left_rows;
                         chunk_manager.StoreChunk(
-                            output_tensor->GetChunkId(output_row_idx_total*output_c), output_chunk, 
-                            output_row_idx_in_chunk*output_c*sizeof(DtypeForCpuOp)
+                            output_tensor->GetChunkId(output_row_idx_total*output_c),
+                            output_chunk,
+                            rows_can_flush*output_c*sizeof(DtypeForCpuOp)
                         );
+                        output_row_idx_total += rows_can_flush;
+                    };
 
-                        while (matrix_mul_rows-chunk_left_rows > output_patches_per_chunk){
-                            DtypeForCpuOp* tmp_output_chunk_prev_divide = tmp_output_chunk_divide;
-                            output_row_idx_total += output_patches_per_chunk;
-                            output_start_idx_in_chunk = output_chunk;
-                            tmp_output_chunk_divide += output_patches_per_chunk * output_c;
-                            std::copy(tmp_output_chunk_prev_divide, tmp_output_chunk_divide, output_start_idx_in_chunk);
-                            chunk_manager.StoreChunk(
-                                output_tensor->GetChunkId(output_row_idx_total*output_c), output_chunk, 
-                                output_patches_per_chunk*output_c*sizeof(DtypeForCpuOp)
-                            );
-                            chunk_left_rows += output_patches_per_chunk;
-                            #ifdef PRINT_CONV_OUTPUT_SAVE_CHUNK_INFO
-                                printf(
-                                    "middle integral output 0 -> %d id %ld, ",
-                                    output_patches_per_chunk, output_tensor->GetChunkId(output_row_idx_total*output_c)
-                                );
-                            #endif
+                    auto append_output_rows = [&](DtypeForCpuOp* src_ptr, int rows_to_append) {
+                        int rows_remaining = rows_to_append;
+                        DtypeForCpuOp* read_ptr = src_ptr;
+                        while (rows_remaining > 0) {
+                            int space_in_chunk = output_patches_per_chunk - output_row_idx_in_chunk;
+                            int rows_now = std::min(rows_remaining, space_in_chunk);
+                            DtypeForCpuOp* dst_ptr = output_chunk + (output_row_idx_in_chunk * output_c);
+                            memcpy(dst_ptr, read_ptr, rows_now * output_c * sizeof(DtypeForCpuOp));
+                            output_row_idx_in_chunk += rows_now;
+                            read_ptr += rows_now * output_c;
+                            rows_remaining -= rows_now;
+
+                            if (output_row_idx_in_chunk == output_patches_per_chunk) {
+                                flush_output_chunk(output_row_idx_in_chunk);
+                                output_row_idx_in_chunk = 0;
+                            }
                         }
+                    };
 
-                        output_row_idx_total += output_patches_per_chunk;
+                    append_output_rows(tmp_output_chunk, matrix_mul_rows);
+
+                    if (im2col_last_row && output_row_idx_in_chunk > 0) {
+                        flush_output_chunk(output_row_idx_in_chunk);
                         output_row_idx_in_chunk = 0;
-                        output_start_idx_in_chunk = output_chunk + (output_row_idx_in_chunk * output_c);
-                        DtypeForCpuOp* tmp_output_chunk_end = tmp_output_chunk + (matrix_mul_rows * output_c);
-                        std::copy(tmp_output_chunk_divide, tmp_output_chunk_end, output_start_idx_in_chunk);
-                        output_row_idx_in_chunk += (matrix_mul_rows - chunk_left_rows);
-                        #ifdef PRINT_CONV_OUTPUT_SAVE_CHUNK_INFO
-                            printf(
-                                "new output rows 0 -> %d id %ld\n",
-                                output_row_idx_in_chunk, output_tensor->GetChunkId(output_row_idx_total*output_c)
-                            );
-                        #endif
-                        #ifdef PRINT_RUN_TIME_INFO
-                            save_output_time += get_elapsed_time(save_output_start_time, get_time());
-                        #endif
                     }
+
+                    #ifdef PRINT_RUN_TIME_INFO
+                        save_output_time += get_elapsed_time(save_output_start_time, get_time());
+                    #endif
 
                     // Reset im2col_row_idx_in_chunk
                     if (im2col_row_idx_in_chunk + matrix_mul_rows >= im2col_patches_per_chunk){

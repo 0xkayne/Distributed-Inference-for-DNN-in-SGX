@@ -7,7 +7,7 @@
   <StackMaxSize>0x2000000</StackMaxSize>        <!-- 32MB max stack -->
   
   <!-- Heap Configuration for EDMM - increased for dynamic allocation -->
-  <HeapMaxSize>0x40000000</HeapMaxSize>         <!-- 1GB max heap for EDMM -->
+  <HeapMaxSize>0x80000000</HeapMaxSize>         <!-- 1GB max heap for EDMM -->
   
   <!-- Thread Control Structure -->
   <TCSNum>4</TCSNum>

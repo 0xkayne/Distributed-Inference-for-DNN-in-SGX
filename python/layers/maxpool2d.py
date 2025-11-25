@@ -20,7 +20,8 @@ class SecretMaxpool2dLayer(SecretActivationLayer):
         self.PlainFunc = torch.nn.MaxPool2d
         self.maxpoolpadding = padding
         self.stride = stride
-        self.STORE_CHUNK_ELEM = 401408
+        # self.STORE_CHUNK_ELEM = 301056
+        self.STORE_CHUNK_ELEM = 9216
 
         self.ForwardFunc = torch.nn.MaxPool2d
 
@@ -36,10 +37,8 @@ class SecretMaxpool2dLayer(SecretActivationLayer):
             raise ValueError("Maxpooling2d apply only to 4D Tensor")
         if self.InputShape[2] != self.InputShape[3]:
             raise ValueError("The input tensor has to be square images")
-        if self.InputShape[2] % self.stride != 0:
-            raise ValueError("The input tensor needs padding for this filter size")
         InputHw = self.InputShape[2]
-        output_hw = InputHw // self.stride
+        output_hw = int((InputHw + 2 * self.maxpoolpadding - self.filter_hw) / self.stride + 1)
         self.OutputShape = [self.InputShape[0], self.InputShape[1], output_hw, output_hw]
         self.HandleShape = self.InputShape
         # self.Shapefortranspose = [int(round(((self.InputShape[0] * self.InputShape[1] * self.InputShape[2] * self.InputShape[3])/262144)+1/2)), 262144, 1, 1]

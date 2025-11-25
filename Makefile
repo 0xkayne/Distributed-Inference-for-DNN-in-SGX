@@ -71,7 +71,8 @@ else
 endif
 
 App_Cpp_Flags_WithoutSGX := $(App_C_Flags) -std=c++11 
-App_Cpp_Flags := $(App_Cpp_Flags_WithoutSGX) -DUSE_SGX
+App_Cpp_Flags := $(App_Cpp_Flags_WithoutSGX) -DUSE_SGX -DMISC_EXINFO
+App_C_Flags += -DMISC_EXINFO
 App_Link_Flags := $(SGX_COMMON_CFLAGS) -L$(SGX_LIBRARY_PATH) -l$(Urts_Library_Name) -L$(TF_LIB) -pthread -fopenmp
 
 ifneq ($(SGX_MODE), HW)
@@ -111,7 +112,7 @@ else
 endif
 
 Enclave_C_Flags += $(Enclave_Include_Paths)
-Enclave_Cpp_Flags := $(Enclave_C_Flags) -std=c++11 -nostdinc++ -DUSE_SGX -DEIGEN_NO_CPUID
+Enclave_Cpp_Flags := $(Enclave_C_Flags) -std=c++11 -nostdinc++ -DUSE_SGX -DEIGEN_NO_CPUID -DMISC_EXINFO
 Enclave_Cpp_Flags += -march=native -maes -ffast-math
 
 # To generate a proper enclave, it is recommended to follow below guideline to link the trusted libraries:

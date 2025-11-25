@@ -47,8 +47,7 @@ def calc_conv2d_output_shape_stride(x_shape, w_shape, padding, stride):
     n_output_channel = w_shape[0]
     img_hw = x_shape[3]
     filter_hw = w_shape[3]
-    assert padding == int(filter_hw / 2)
-    output_hw = int( (img_hw + 2 * padding - filter_hw)/stride +1 )
+    output_hw = int((img_hw + 2 * padding - filter_hw) / stride + 1)
     return [batch_size, n_output_channel, output_hw, output_hw]
 
 

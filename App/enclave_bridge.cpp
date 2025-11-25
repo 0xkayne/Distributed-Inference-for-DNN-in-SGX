@@ -127,7 +127,7 @@ static sgx_errlist_t sgx_errlist[] = {
     },
 };
 
-void print_error_message(sgx_status_t ret);
+void print_error_message(sgx_status_t ret, const char* context = nullptr);
 
 DimsT CreateDims(int dim0_, int dim1_, int dim2_, int dim3_) {
     DimsT res = {dim0_, dim1_, dim2_, dim3_};
@@ -158,7 +158,7 @@ void ModP(MapEigenTensor& m) {
 }
 
 /* Check error conditions for loading enclave */
-void print_error_message(sgx_status_t ret)
+void print_error_message(sgx_status_t ret, const char* context)
 {
     size_t idx = 0;
     size_t ttl = sizeof sgx_errlist/sizeof sgx_errlist[0];
@@ -167,13 +167,20 @@ void print_error_message(sgx_status_t ret)
         if(ret == sgx_errlist[idx].err) {
             if(NULL != sgx_errlist[idx].sug)
                 printf("Info: %s\n", sgx_errlist[idx].sug);
-            printf("Error: %s\n", sgx_errlist[idx].msg);
+            if (context) {
+                printf("[%s] ", context);
+            }
+            printf("Error: %s (0x%04x)\n", sgx_errlist[idx].msg, ret);
             break;
         }
     }
 
-    if (idx == ttl)
-        printf("Error: Unexpected error occurred.\n");
+    if (idx == ttl) {
+        if (context) {
+            printf("[%s] ", context);
+        }
+        printf("Error: Unexpected error occurred (0x%04x).\n", ret);
+    }
 }
 
 /* OCall functions */
@@ -341,8 +348,23 @@ extern "C"
         sgx_misc_attribute_t misc_attr;
         memset(&misc_attr, 0, sizeof(misc_attr));
 
-        /* Use standard sgx_create_enclave for better compatibility */
+#if defined(SGX_CREATE_ENCLAVE_EX_KSS)
+        const void* ex_features_p[MAX_EX_FEATURES_COUNT] = {nullptr};
+        const uint32_t ex_features = 0;
+        ret = sgx_create_enclave_ex(
+            ENCLAVE_FILENAME,
+            SGX_DEBUG_FLAG,
+            &token,
+            &updated,
+            &eid,
+            &misc_attr,
+            ex_features,
+            ex_features_p
+        );
+#else
+        /* Fallback for older SDKs without sgx_create_enclave_ex */
         ret = sgx_create_enclave(ENCLAVE_FILENAME, SGX_DEBUG_FLAG, &token, &updated, &eid, &misc_attr);
+#endif
         
         if (ret != SGX_SUCCESS) {
             print_error_message(ret);
