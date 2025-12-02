@@ -1,14 +1,9 @@
 """
-Distributed inference demo where Partition-1 runs inside an SGX enclave.
+Distributed inference demo with flexible graph partitioning.
 
-Partition 1 (thread #1 / enclave):
-    Executes the real `SecretParallelToyNet` layers up through LayerC
-    (including LayerA_Pool / LayerB_ReLU) inside SGX and streams B_out/C_out.
-
-Partition 2 (thread #2 / host):
-    Waits for B_out to continue with host-side LayerD,
-    waits for C_out before computing E, and finally finishes with F.
-    A sequential reference path is also available to quantify the parallel speedup.
+Allows arbitrary mapping of layers to Enclave/CPU/GPU modes.
+The runtime automatically analyzes the topology, creates communication queues for cut edges,
+and orchestrates two worker threads (one for Enclave, one for Host) to execute the split graph.
 """
 
 from __future__ import annotations
@@ -17,7 +12,7 @@ import queue
 import threading
 import time
 from datetime import datetime
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 try:
     import torch as _torch_mod  # type: ignore[import]
@@ -34,24 +29,14 @@ from python.sgx_net import SecretNeuralNetwork
 from python.utils.basic_utils import ExecutionModeOptions
 
 
-# LayerA is forced onto CPU to avoid SGX SetTen failures during enclave input upload.
-_ENCLAVE_LAYER_OVERRIDES = {
-    "LayerA": ExecutionModeOptions.CPU,
-}
-
-
 def _format_timestamp(ts: float) -> str:
-    """
-    Convert epoch timestamp to human-readable HH:MM:SS.microseconds string.
-    """
     return datetime.fromtimestamp(ts).strftime("%H:%M:%S.%f")
 
 
 def _ensure_torch():
     if _torch_mod is None:
         raise ModuleNotFoundError(
-            "torch is required for enclave partition execution. "
-            "Please install PyTorch to continue."
+            "torch is required. Please install PyTorch."
         )
     return _torch_mod
 
@@ -62,9 +47,6 @@ def _time_layer(
     fn: Callable[[], Any],
     timings: Optional[Dict[str, float]] = None,
 ) -> Any:
-    """
-    Execute `fn` while logging wall-clock start/end timestamps for a layer.
-    """
     start_ts = time.time()
     print(f"{partition_label} {layer_name} start @ {_format_timestamp(start_ts)}")
     result = fn()
@@ -78,275 +60,122 @@ def _time_layer(
         timings[layer_name] = duration_ms
     return result
 
+# Global lock to synchronize access to GlobalTensor's shared state (static dicts)
+# and Enclave bridge calls if necessary.
+_GT_LOCK = threading.Lock()
 
-def _compute_layer_d(torch_mod, b_out):
+class FlexibleGraphWorker(threading.Thread):
     """
-    LayerD is modeled as an identity bridge feeding LayerE.
-    """
-    return b_out.detach().clone()
-
-
-def _compute_layer_e(torch_mod, c_out, d_out):
-    """
-    LayerE performs the residual merge between the enclave and host branches.
-    """
-    return c_out + d_out
-
-
-def _compute_layer_f(torch_mod, e_out):
-    """
-    LayerF scales the merged activations to keep parity with PlainParallelTorchNet.
-    """
-    return 0.8 * e_out
-
-
-def _run_head_partition(
-    partition_label: str,
-    input_tensor: Any,
-    batch_size: int,
-    channels: int,
-    height: int,
-    width: int,
-    publish: Optional[Callable[[str, Any], None]] = None,
-) -> Dict[str, Any]:
-    """
-    Execute the SecretParallelToyNet layers up to LayerC and optionally publish
-    intermediate tensors (LayerB / LayerC) as soon as they are available.
-    """
-
-    _ensure_torch()
-    model = SecretParallelToyNet(
-        sid=0,
-        enclave_mode=ExecutionModeOptions.Enclave,
-        batch_size=batch_size,
-        channels=channels,
-        height=height,
-        width=width,
-        layer_mode_overrides=_ENCLAVE_LAYER_OVERRIDES,
-    )
-
-    published: Dict[str, Any] = {}
-
-    try:
-        if not GlobalTensor.is_init_global_tensor:
-            GlobalTensor.init()
-
-        secret_nn = SecretNeuralNetwork(model.sid, model.model_name)
-        secret_nn.set_eid(GlobalTensor.get_eid())
-        secret_nn.set_layers(model.layers)
-
-        input_layer = model.layers[0]
-        input_layer.set_input(input_tensor)
-
-        for layer in model.layers:
-            layer_name = layer.LayerName
-            _time_layer(partition_label, layer_name, layer.forward)
-
-            if layer_name == "LayerB":
-                layer.transfer_enclave_to_cpu("output")
-                b_out = layer.get_cpu("output").detach().clone()
-                published[layer_name] = b_out
-                if publish is not None:
-                    publish(layer_name, b_out)
-
-            if layer_name == "LayerC":
-                layer.transfer_enclave_to_cpu("output")
-                c_out = layer.get_cpu("output").detach().clone()
-                published[layer_name] = c_out
-                if publish is not None:
-                    publish(layer_name, c_out)
-                break
-    finally:
-        if GlobalTensor.is_init_global_tensor:
-            GlobalTensor.destroy()
-
-    return published
-
-
-class EnclavePartitionWorker(threading.Thread):
-    """
-    Executes layers A -> B -> C of SecretParallelToyNet inside SGX.
+    Generic worker that executes a subset of layers based on their assigned mode.
+    Handles data fetching from queues for cut edges (incoming) and publishing to queues (outgoing).
+    
+    Crucially, both workers SHARE the same model instance to avoid GlobalTensor double-initialization issues.
     """
 
     def __init__(
         self,
-        input_tensor: Any,
-        b_queue: "queue.Queue[Any]",
-        c_queue: "queue.Queue[Any]",
-        batch_size: int,
-        channels: int,
-        height: int,
-        width: int,
+        worker_id: str,
+        target_mode: ExecutionModeOptions,
+        shared_model: SecretParallelToyNet,
+        queues: Dict[str, "queue.Queue[Any]"],
+        timings: Dict[str, float],
+        init_event: threading.Event,
     ):
-        super().__init__(name="Partition-1-Enclave")
-        self.input_tensor = input_tensor
-        self.b_queue = b_queue
-        self.c_queue = c_queue
-        self.batch_size = batch_size
-        self.channels = channels
-        self.height = height
-        self.width = width
-        self.partition_label = "[Partition-1]"
+        super().__init__(name=worker_id)
+        self.worker_id = worker_id
+        self.target_mode = target_mode
+        self.model = shared_model
+        self.queues = queues  # Key: "SrcLayerName->DstLayerName"
+        self.timings = timings
+        self.init_event = init_event
+        self.daemon = True # Allow exiting if main thread fails
 
     def run(self) -> None:
-        _run_head_partition(
-            self.partition_label,
-            self.input_tensor,
-            self.batch_size,
-            self.channels,
-            self.height,
-            self.width,
-            publish=self._publish_output,
-        )
+        _ensure_torch()
+        
+        # Wait for the main thread to finish initializing the shared model
+        # This ensures GlobalTensor is fully set up before any worker starts processing.
+        self.init_event.wait()
+        
+        try:
+            for layer in self.model.layers:
+                # 1. Skip layers not assigned to this worker
+                if layer.EnclaveMode != self.target_mode:
+                    continue
 
-    def _publish_output(self, layer_name: str, tensor: Any) -> None:
-        if layer_name == "LayerB":
-            self.b_queue.put(tensor)
-            print(f"{self.partition_label} published B_out")
-        elif layer_name == "LayerC":
-            self.c_queue.put(tensor)
-            print(f"{self.partition_label} published C_out")
+                # 2. Resolve dependencies
+                if layer.PrevLayer:
+                    parents = layer.PrevLayer if isinstance(layer.PrevLayer, list) else [layer.PrevLayer]
+                    for parent in parents:
+                        if parent.EnclaveMode != self.target_mode:
+                            queue_key = f"{parent.LayerName}->{layer.LayerName}"
+                            print(f"{self.worker_id} waiting for dependency: {queue_key}")
+                            
+                            # Blocking get
+                            data = self.queues[queue_key].get()
+                            
+                            # Inject data. Needs lock because it touches GlobalTensor cpu_tensor dict
+                            with _GT_LOCK:
+                                parent.set_cpu("output", data)
+                                # Note: forward_tensor_transfer inside layer.forward() will handle 
+                                # CPU -> Enclave transfer if needed, assuming set_cpu updated the source.
+                                
+                            print(f"{self.worker_id} resolved dependency: {queue_key}")
+
+                # 3. Execute Layer
+                # We wrap forward execution in a try-except block to catch errors.
+                # Note: Since we share the model, 'layer' objects are shared.
+                # But each layer is executed by ONLY one worker (determined by EnclaveMode).
+                # So there is no race condition on executing the *same* layer.
+                # Race conditions on *data* (set_cpu/get_cpu) are handled by _GT_LOCK.
+                _time_layer(self.worker_id, layer.LayerName, layer.forward, self.timings)
+
+                # 4. Publish Output
+                # Scan for outgoing edges
+                # We look for queues starting with our layer name
+                out_data_cache = None
+                for key, q in self.queues.items():
+                    src, dst = key.split("->")
+                    if src == layer.LayerName:
+                        # This is an outgoing cut edge
+                        if out_data_cache is None:
+                            # Fetch output
+                            with _GT_LOCK:
+                                if layer.EnclaveMode == ExecutionModeOptions.Enclave:
+                                    layer.transfer_enclave_to_cpu("output")
+                                out_data_cache = layer.get_cpu("output").detach().clone()
+                        
+                        q.put(out_data_cache)
+                        print(f"{self.worker_id} published data to: {key}")
+
+        except Exception as e:
+            print(f"{self.worker_id} FAILED with error: {e}")
+            import traceback
+            traceback.print_exc()
 
 
-class HostPartitionWorker(threading.Thread):
+def _analyze_topology_and_create_queues(model: SecretParallelToyNet) -> Dict[str, "queue.Queue[Any]"]:
     """
-    Host-side worker consuming B_out/C_out and executing D -> E -> F on CPU.
+    Analyze the model's layers and execution modes to find 'Cut Edges'.
+    Returns a dictionary of queues for these edges.
     """
-
-    def __init__(
-        self,
-        b_queue: "queue.Queue[Any]",
-        c_queue: "queue.Queue[Any]",
-        result_queue: "queue.Queue[Any]",
-    ):
-        super().__init__(name="Partition-2-Host")
-        self.b_queue = b_queue
-        self.c_queue = c_queue
-        self.result_queue = result_queue
-        self.partition_label = "[Partition-2]"
-
-    def run(self) -> None:
-        torch = _ensure_torch()
-
-        b_out = self.b_queue.get()
-        print(f"{self.partition_label} received B_out")
-        b_out_snapshot = b_out.detach().clone()
-
-        d_out = _time_layer(
-            self.partition_label,
-            "LayerD",
-            lambda: _compute_layer_d(torch, b_out),
-        )
-
-        c_out = self.c_queue.get()
-        print(f"{self.partition_label} received C_out")
-        c_out_snapshot = c_out.detach().clone()
-
-        e_out = _time_layer(
-            self.partition_label,
-            "LayerE",
-            lambda: _compute_layer_e(torch, c_out, d_out),
-        )
-
-        f_out = _time_layer(
-            self.partition_label,
-            "LayerF",
-            lambda: _compute_layer_f(torch, e_out),
-        )
-
-        self.result_queue.put(
-            {
-                "b_out": b_out_snapshot,
-                "c_out": c_out_snapshot,
-                "final": f_out,
-            }
-        )
-        print(f"{self.partition_label} inference completed")
-
-
-def _run_sequential_reference(
-    input_tensor: Any,
-    batch_size: int,
-    channels: int,
-    height: int,
-    width: int,
-) -> Dict[str, Any]:
-    """
-    Run the pipeline sequentially (without threads) to establish a baseline latency.
-    """
-
-    start_ts = time.time()
-    published = _run_head_partition(
-        "[Sequential-Head]",
-        input_tensor,
-        batch_size,
-        channels,
-        height,
-        width,
-        publish=None,
-    )
-
-    torch = _ensure_torch()
-    tail_timings: Dict[str, float] = {}
-
-    b_out = published.get("LayerB")
-    c_out = published.get("LayerC")
-    if b_out is None or c_out is None:
-        raise RuntimeError("Sequential reference run failed to produce LayerB/LayerC outputs.")
-
-    d_out = _time_layer(
-        "[Sequential-Tail]",
-        "LayerD",
-        lambda: _compute_layer_d(torch, b_out),
-        tail_timings,
-    )
-    e_out = _time_layer(
-        "[Sequential-Tail]",
-        "LayerE",
-        lambda: _compute_layer_e(torch, c_out, d_out),
-        tail_timings,
-    )
-    final_out = _time_layer(
-        "[Sequential-Tail]",
-        "LayerF",
-        lambda: _compute_layer_f(torch, e_out),
-        tail_timings,
-    )
-
-    total_latency_ms = (time.time() - start_ts) * 1000
-    print(
-        "[Sequential] end-to-end latency "
-        f"{total_latency_ms:.3f} ms (tail breakdown: {tail_timings})"
-    )
-
-    return {
-        "b_out": b_out,
-        "c_out": c_out,
-        "final": final_out,
-        "latency_ms": total_latency_ms,
-    }
-
-
-def _report_tensor_delta(label: str, reference: Any, candidate: Any, atol: float = 1e-4) -> None:
-    """
-    Compare tensors from sequential vs parallel executions and log the delta.
-    """
-    torch = _ensure_torch()
-    if not isinstance(reference, torch.Tensor) or not isinstance(candidate, torch.Tensor):
-        print(f"[Benchmark] {label} comparison skipped (non-tensor inputs).")
-        return
-
-    diff = torch.max(torch.abs(reference - candidate)).item()
-    if torch.allclose(reference, candidate, atol=atol, rtol=0.0):
-        print(
-            f"[Benchmark] {label} matches sequential reference "
-            f"(max |diff|={diff:.3e}, atol={atol})."
-        )
-    else:
-        print(
-            f"[Benchmark] WARNING: {label} deviates from sequential reference "
-            f"(max |diff|={diff:.3e}, atol={atol})."
-        )
+    queues = {}
+    
+    for layer in model.layers:
+        parents = []
+        if layer.PrevLayer:
+            if isinstance(layer.PrevLayer, list):
+                parents = layer.PrevLayer
+            else:
+                parents = [layer.PrevLayer]
+        
+        for parent in parents:
+            if parent.EnclaveMode != layer.EnclaveMode:
+                key = f"{parent.LayerName}->{layer.LayerName}"
+                queues[key] = queue.Queue(maxsize=1)
+                print(f"[Topology] Found cut edge: {key} ({parent.EnclaveMode} -> {layer.EnclaveMode})")
+                
+    return queues
 
 
 def run_distributed_inference(
@@ -354,91 +183,106 @@ def run_distributed_inference(
     channels: int = 3,
     height: int = 4,
     width: int = 4,
-    measure_baseline: bool = True,
-) -> Tuple[Any, Any]:
+    layer_mode_overrides: Optional[Dict[str, ExecutionModeOptions]] = None,
+) -> Dict[str, Any]:
     """
-    Launch both partitions, wait for completion, and return intermediate/final tensors.
-
-    Args:
-        batch_size/channels/height/width: Input tensor shape parameters.
-        measure_baseline: When True, run a sequential reference pass before the
-            threaded execution to highlight the latency improvement.
+    Run distributed inference with flexible partitioning.
     """
-
     torch = _ensure_torch()
-
     torch.manual_seed(0)
     input_tensor = torch.randn(batch_size, channels, height, width)
     print(f"Input tensor shape: {tuple(input_tensor.shape)}")
 
-    sequential_stats: Optional[Dict[str, Any]] = None
-    if measure_baseline:
-        sequential_stats = _run_sequential_reference(
-            input_tensor.clone(),
-            batch_size,
-            channels,
-            height,
-            width,
-        )
-
-    b_queue: "queue.Queue[Any]" = queue.Queue(maxsize=1)
-    c_queue: "queue.Queue[Any]" = queue.Queue(maxsize=1)
-    result_queue: "queue.Queue[Any]" = queue.Queue(maxsize=1)
-
-    enclave_worker = EnclavePartitionWorker(
-        input_tensor=input_tensor,
-        b_queue=b_queue,
-        c_queue=c_queue,
+    if layer_mode_overrides is None:
+        layer_mode_overrides = {"LayerA": ExecutionModeOptions.CPU}
+        
+    # 1. Instantiate ONE shared model
+    # This avoids the 'Tags must linked before tensor initialization' error
+    # because we only init GlobalTensor and link tags once.
+    
+    if not GlobalTensor.is_init_global_tensor:
+        GlobalTensor.init()
+        
+    shared_model = SecretParallelToyNet(
+        sid=0,
+        enclave_mode=ExecutionModeOptions.Enclave,
         batch_size=batch_size,
         channels=channels,
         height=height,
         width=width,
+        layer_mode_overrides=layer_mode_overrides,
     )
-    host_worker = HostPartitionWorker(b_queue, c_queue, result_queue)
+    
+    # Initialize the SecretNeuralNetwork wrapper to set up layer links and allocate tensors
+    secret_nn = SecretNeuralNetwork(shared_model.sid, shared_model.model_name)
+    secret_nn.set_eid(GlobalTensor.get_eid())
+    secret_nn.set_layers(shared_model.layers)
+    
+    # Analyze topology after model is fully built and configured
+    queues = _analyze_topology_and_create_queues(shared_model)
+    
+    # Set input on the shared model
+    # If InputLayer is CPU, set_input sets CPU tensor.
+    # If InputLayer is Enclave, it sets CPU and transfers to Enclave.
+    # Since we do this in main thread, no lock needed yet (workers not started).
+    shared_model.layers[0].set_input(input_tensor)
 
-    parallel_start = time.time()
+    timings: Dict[str, float] = {}
+    init_event = threading.Event()
+
+    # 2. Create Workers sharing the SAME model instance
+    enclave_worker = FlexibleGraphWorker(
+        worker_id="[Partition-Enclave]",
+        target_mode=ExecutionModeOptions.Enclave,
+        shared_model=shared_model,
+        queues=queues,
+        timings=timings,
+        init_event=init_event
+    )
+    
+    host_worker = FlexibleGraphWorker(
+        worker_id="[Partition-Host]",
+        target_mode=ExecutionModeOptions.CPU,
+        shared_model=shared_model,
+        queues=queues,
+        timings=timings,
+        init_event=init_event
+    )
+
+    print("\nStarting distributed inference...")
+    start_ts = time.time()
+    
     enclave_worker.start()
     host_worker.start()
-
+    
+    # Signal workers that init is done and model is ready
+    init_event.set()
+    
     enclave_worker.join()
     host_worker.join()
+    
+    end_ts = time.time()
+    
+    # Cleanup
+    if GlobalTensor.is_init_global_tensor:
+        GlobalTensor.destroy()
+        
+    latency_ms = (end_ts - start_ts) * 1000
+    print(f"\n[Distributed] Total Latency: {latency_ms:.3f} ms")
+    
+    return {"latency_ms": latency_ms, "timings": timings}
 
-    parallel_latency_ms = (time.time() - parallel_start) * 1000
-    results = result_queue.get()
-    b_out = results["b_out"]
-    c_out = results["c_out"]
-    final_output = results["final"]
-
-    print(f"[Parallel] end-to-end latency {parallel_latency_ms:.3f} ms")
-
-    if sequential_stats is not None:
-        speedup = sequential_stats["latency_ms"] / max(parallel_latency_ms, 1e-9)
-        print(
-            "[Benchmark] Sequential vs parallel latency: "
-            f"{sequential_stats['latency_ms']:.3f} ms vs {parallel_latency_ms:.3f} ms "
-            f"(speedup {speedup:.2f}x)"
-        )
-        _report_tensor_delta("B_out", sequential_stats["b_out"], b_out)
-        _report_tensor_delta("C_out", sequential_stats["c_out"], c_out)
-        _report_tensor_delta("Final output", sequential_stats["final"], final_output)
-
-    return b_out, final_output
-
-
-def main() -> None:
-    try:
-        torch = _ensure_torch()
-        b_out, final_out = run_distributed_inference()
-        print("B_out sample:", b_out.view(-1)[:5])
-        print("Final output sample:", final_out.view(-1)[:5])
-    except ModuleNotFoundError as exc:
-        print(
-            "Missing dependency while attempting to run enclave partition. "
-            "Please ensure SGX runtime prerequisites (e.g., numpy/torch) are installed."
-        )
-        raise exc
-
+def main():
+    # Layer A/B/C on SGX, D/E/F on CPU
+    # LayerA must be CPU due to issue
+    overrides = {
+        "LayerA": ExecutionModeOptions.CPU,
+        "LayerD": ExecutionModeOptions.CPU,
+        "LayerE": ExecutionModeOptions.CPU,
+        "LayerF": ExecutionModeOptions.CPU,
+    }
+    
+    run_distributed_inference(layer_mode_overrides=overrides)
 
 if __name__ == "__main__":
     main()
-
