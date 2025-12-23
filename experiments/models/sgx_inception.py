@@ -381,7 +381,7 @@ class SGXInceptionV3:
         self.layers.extend(red_b.layers)
         
         # ========== Inception-C (x2) ==========
-        # Inception-C: 1280 -> 2048 channels (320+384+384+448)
+        # Inception-C: 1280 -> 1280 channels (320+384+384+192)
         for i in range(2):
             inc_c = InceptionBlock(sid, f"inception_c{i+1}", self.enclave_mode, in_channels=1280,
                                    ch1x1=320, ch3x3_red=384, ch3x3=384, ch5x5_red=448, ch5x5=384, pool_proj=192,
@@ -391,9 +391,9 @@ class SGXInceptionV3:
         
         # ========== Classifier ==========
         # Global Average Pooling
-        # For 299x299 input, after all reductions, feature map should be ~8x8
-        # Use adaptive pooling to handle different input sizes
-        final_size = max(1, self.input_size // 32)  # Approximate final feature map size
+        # For 299x299 input, after all reductions, feature map is 8x8
+        # Inception V3 downsampling: 299 -> 149 (stem) -> 73 -> 35 -> 17 (reduction A) -> 8 (reduction B)
+        final_size = 8  # Fixed to match actual Inception V3 feature map size
         avgpool = SecretAvgpool2dLayer(sid, "avgpool", self._get_mode("avgpool"),
                                        filter_hw=final_size, stride=1, padding=0,
                                        manually_register_prev=True, manually_register_next=True)
@@ -403,10 +403,10 @@ class SGXInceptionV3:
                                      manually_register_prev=True, manually_register_next=True)
         flatten.register_prev_layer(avgpool)
         
-        # FC layer: 2048 -> num_classes
-        # Note: Inception-C output is 2048 channels
+        # FC layer: 1280 -> num_classes
+        # Note: Inception-C output is 1280 channels (320+384+384+192)
         fc = SGXLinearBase(sid, "fc", self._get_mode("fc"), batch_size=self.batch_size,
-                           n_output_features=self.num_classes, n_input_features=2048,
+                           n_output_features=self.num_classes, n_input_features=1280,
                            manually_register_prev=True, manually_register_next=True)
         fc.register_prev_layer(flatten)
         

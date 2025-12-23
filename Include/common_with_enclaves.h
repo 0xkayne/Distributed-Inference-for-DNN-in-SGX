@@ -29,20 +29,20 @@
 // #define PrimeLimit ((1 << 9) - 3)
 #define HalfPrime PrimeLimit / 2
 
-//#define STORE_CHUNK_ELEM 940800
-// #define STORE_CHUNK_ELEM 940800
+//#define STORE_CHUNK_ELEM 4276896
+// #define STORE_CHUNK_ELEM 4276896
 // #define WORK_CHUNK_ELEM 4096
-// #define STORE_CHUNK_ELEM 940800
+// #define STORE_CHUNK_ELEM 4276896
 // #define WORK_CHUNK_ELEM 64
 // 301056 = 4704 * 64
 // If set too small (56*56) input maybe incorrect
-// #define STORE_CHUNK_ELEM 940800
-// #define STORE_CHUNK_ELEM 940800
+// #define STORE_CHUNK_ELEM 4276896
+// #define STORE_CHUNK_ELEM 4276896
 // 4704 = 7 * 7 * 3 * 32
 // 4704 = 49 * 96
-// #define STORE_CHUNK_ELEM 940800
+// #define STORE_CHUNK_ELEM 4276896
 // #define WORK_CHUNK_ELEM 4704
-// #define STORE_CHUNK_ELEM 940800
+// #define STORE_CHUNK_ELEM 4276896
 // #define WORK_CHUNK_ELEM 30191616
 
 // 301056
@@ -53,8 +53,8 @@
 // Calculated value: 725043200 (satisfies all critical constraints)
 // Note: This is ~2.7GB, ensure sufficient EPC memory
 // If memory is insufficient, consider using smaller input size (e.g., 224x224) or a smaller value
-#define STORE_CHUNK_ELEM 940800
-#define WORK_CHUNK_ELEM 725043200
+#define STORE_CHUNK_ELEM 4276896
+#define WORK_CHUNK_ELEM 4276896
 
 #define NEAREST 0
 #define STOCHASTIC 1

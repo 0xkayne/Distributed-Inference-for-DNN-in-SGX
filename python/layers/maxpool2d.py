@@ -20,9 +20,7 @@ class SecretMaxpool2dLayer(SecretActivationLayer):
         self.PlainFunc = torch.nn.MaxPool2d
         self.maxpoolpadding = padding
         self.stride = stride
-        # self.STORE_CHUNK_ELEM = 940800
-        # self.STORE_CHUNK_ELEM = 940800
-        self.STORE_CHUNK_ELEM = 940800
+        self.STORE_CHUNK_ELEM = 4276896
         self.ForwardFunc = torch.nn.MaxPool2d
 
         if EnclaveMode == ExecutionModeOptions.Enclave :
