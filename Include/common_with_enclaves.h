@@ -29,25 +29,32 @@
 // #define PrimeLimit ((1 << 9) - 3)
 #define HalfPrime PrimeLimit / 2
 
-//#define STORE_CHUNK_ELEM 2097153
-// #define STORE_CHUNK_ELEM 262144
+//#define STORE_CHUNK_ELEM 940800
+// #define STORE_CHUNK_ELEM 940800
 // #define WORK_CHUNK_ELEM 4096
-// #define STORE_CHUNK_ELEM 128
+// #define STORE_CHUNK_ELEM 940800
 // #define WORK_CHUNK_ELEM 64
 // 301056 = 4704 * 64
 // If set too small (56*56) input maybe incorrect
-// #define STORE_CHUNK_ELEM 602112
-// #define STORE_CHUNK_ELEM 1204224
+// #define STORE_CHUNK_ELEM 940800
+// #define STORE_CHUNK_ELEM 940800
 // 4704 = 7 * 7 * 3 * 32
 // 4704 = 49 * 96
-// #define STORE_CHUNK_ELEM 4704
+// #define STORE_CHUNK_ELEM 940800
 // #define WORK_CHUNK_ELEM 4704
-// #define STORE_CHUNK_ELEM 30191616
+// #define STORE_CHUNK_ELEM 940800
 // #define WORK_CHUNK_ELEM 30191616
 
 // 301056
-#define STORE_CHUNK_ELEM 9216
-#define WORK_CHUNK_ELEM 9216
+// Original value for small models: 9216
+// For standard Inception V3 (299x299 input), need larger value to satisfy divisibility constraints:
+// - MaxPool constraints: 1225 (35x35), 289 (17x17), 64 (8x8)
+// - Linear constraint: 2048
+// Calculated value: 725043200 (satisfies all critical constraints)
+// Note: This is ~2.7GB, ensure sufficient EPC memory
+// If memory is insufficient, consider using smaller input size (e.g., 224x224) or a smaller value
+#define STORE_CHUNK_ELEM 940800
+#define WORK_CHUNK_ELEM 725043200
 
 #define NEAREST 0
 #define STOCHASTIC 1

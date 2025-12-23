@@ -1,7 +1,5 @@
-<!-- # A TEE-based Confidential Heterogeneous Deployment Framework for DNN Models -->
+# 基于 DNN 拓扑结构的分布式并行推理加速研究
 
-<!-- <div align="left"> -->
-<h1>TAOISM: A <ins>T</ins>EE-b<ins>a</ins>sed C<ins>o</ins>nfident<ins>i</ins>al Heterogeneou<ins>s</ins> Fra<ins>m</ins>ework for DNN Models</h1>
 <div align="center">
   <a href="https://opensource.org/license/mit/">
     <img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-blue">
@@ -9,393 +7,576 @@
   <a href="https://pytorch.org/">
     <img src="https://img.shields.io/badge/PyTorch->=v1.7.0-EE4C2C.svg?style=flat-square">
   </a>
-  <a href="hhttps://opensource.org/license/mit/">
-    <img src="https://img.shields.io/badge/SGX_SDK->2.6-green">
+  <a href="#">
+    <img src="https://img.shields.io/badge/SGX2-EDMM_Enabled-orange">
   </a>
 </div>
-<!-- <div align="left"> -->
 
+---
 
-<div align="center">
-<img src=asset/TAOISM.png width=60% />
-</div>
+## 目录
 
+- [1. 研究概述](#1-研究概述)
+- [2. 方法论](#2-方法论)
+- [3. 环境配置](#3-环境配置)
+- [4. 基本使用](#4-基本使用)
+- [5. 实验指南](#5-实验指南)
+- [6. 代码结构](#6-代码结构)
+- [7. STORE_CHUNK_ELEM 配置参考](#7-store_chunk_elem-配置参考)
+- [8. 故障排除](#8-故障排除)
+- [9. 主要结果](#9-主要结果)
+- [10. 假设与限制](#10-假设与限制)
+- [11. 引用](#11-引用)
 
+---
 
-TAOISM is a <ins>T</ins>EE-b<ins>A</ins>sed c<ins>O</ins>nfident<ins>I</ins>al heterogeneou<ins>S</ins> fra<ins>M</ins>ework for DNN Models. TAOISM is light-weight, flexible and compatible to PyTorch models. TAOISM can put some privacy-related and critical layers of a DNN model into SGX enclaves, and the rest of the model is executed on GPU. TAOISM is designed to evaluate the inference speed of various TEE-Shielded DNN Partition (TSDP) strategies. 
+## 1. 研究概述
 
+### 1.1 研究背景与动机
 
+在可信执行环境（TEE，如 Intel SGX）中执行 DNN 推理是实现隐私保护机器学习的重要手段。然而，SGX Enclave 的执行开销显著高于普通 CPU/GPU 执行。
 
-<center>
-    <img src="asset/TSDP.png" width=100% >
-</center>
-<p align="center">
-    <em>Demonstration of six TSDP strategies.</em>
-    <br>
-</p>
+### 1.2 核心研究问题
 
+> **能否通过对 DNN 模型进行适当分割，利用网络拓扑中的并行结构，采用分布式方式实现端到端推理加速？**
 
+### 1.3 研究贡献
 
-For more detail of the framework and TSDP strategies, please refer to our S&P'24 paper:
+1. **成本测量框架**：系统化测量 6 种 DNN 模型在 CPU/Enclave 环境下的层级性能
+2. **分布式推理引擎**：支持任意 DAG 拓扑结构的多分区并行执行框架
+3. **实验验证**：在 ResNet-18 上实现 **35% 端到端加速**
 
-[*No Privacy Left Outside: On the (In-)Security of TEE-Shielded DNN Partition for On-Device ML*](https://arxiv.org/abs/2310.07152) </br>
-**Ziqi Zhang, Chen Gong, Yifeng Cai, Yuanyuan Yuan, Bingyan Liu, Ding Li, Yao Guo, Xiangqun Chen** </br>
+---
 
+## 2. 方法论
 
-If you found this code helpful for your research, please cite our paper:
+### 2.1 核心思想
 
 ```
-@article{zhang2023no,
-  title={No Privacy Left Outside: On the (In-) Security of TEE-Shielded DNN Partition for On-Device ML},
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        传统串行推理 vs 分布式并行推理                      │
+├─────────────────────────────────────────────────────────────────────────┤
+│   【传统方式】整个模型在 Enclave 中串行执行                                │
+│   Input → [Layer1] → [Layer2] → ... → [LayerN] → Output                │
+│                                                                         │
+│   【本研究】利用网络并行结构，分区并行执行                                  │
+│                    ┌─[Partition-A: Enclave]─┐                          │
+│   Input → Split → │  Layer1 → Layer2        │ → Merge → Output         │
+│                    └────────────────────────┘                          │
+│                    ┌─[Partition-B: CPU]─────┐                          │
+│                    │  Layer3 → Layer4        │ (并行执行)               │
+│                    └────────────────────────┘                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 2.2 分布式推理框架设计
+
+- **FlexibleGraphWorker**：通用图执行线程，处理跨分区依赖
+- **拓扑分析**：自动识别"切边"并创建通信队列
+- **多线程安全**：共享模型实例，避免 GlobalTensor 冲突
+
+---
+
+## 3. 环境配置
+
+### 3.1 硬件要求
+
+| 组件 | 要求 |
+|------|------|
+| **CPU** | Intel SGX2 支持 (Ice Lake+) |
+| **内存** | ≥16GB |
+| **EPC** | ≥128MB（BIOS 中配置） |
+
+### 3.2 软件要求
+
+| 软件 | 版本 |
+|------|------|
+| Ubuntu | 20.04 LTS |
+| Intel SGX SDK | ≥2.19 |
+| Python | 3.7+ |
+| PyTorch | ≥1.7.0 |
+
+### 3.3 安装步骤
+
+```bash
+# 1. 克隆仓库
+git clone <repository-url>
+cd TAOISM
+
+# 2. 检查 SGX 支持
+bash scripts/check_sgx2_edmm.sh
+
+# 3. 创建 Python 环境
+conda create -n taoism python=3.7 -y
+conda activate taoism
+conda install pytorch==1.7.0 torchvision==0.8.0 cudatoolkit=11.0 -c pytorch
+
+# 4. 编译框架
+source /opt/intel/sgxsdk/environment
+make clean && make
+
+# 预期输出：
+#   - App/bin/enclave_bridge.so (~156KB)
+#   - enclave.signed.so (~448KB)
+```
+
+---
+
+## 4. 基本使用
+
+### 4.1 环境激活（每次使用前必须执行）
+
+```bash
+# 完整环境设置脚本
+source /opt/intel/sgxsdk/environment
+export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$SGX_SDK/lib64:$LD_LIBRARY_PATH
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate taoism
+```
+
+**建议**：将上述命令添加到 `~/.bashrc` 或创建快捷脚本：
+
+```bash
+# 创建快捷脚本
+cat > activate_taoism.sh << 'EOF'
+#!/bin/bash
+source /opt/intel/sgxsdk/environment
+export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$SGX_SDK/lib64:$LD_LIBRARY_PATH
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate taoism
+echo "✓ TAOISM 环境已激活"
+EOF
+chmod +x activate_taoism.sh
+
+# 使用
+source ./activate_taoism.sh
+```
+
+### 4.2 验证安装
+
+```bash
+# 验证 Enclave 初始化
+python3 << 'EOF'
+import sys
+sys.path.insert(0, '.')
+from python.enclave_interfaces import EnclaveInterface
+print("Initializing SGX2 EDMM Enclave...")
+enclave = EnclaveInterface()
+print(f"✓ SUCCESS: Enclave ID = {enclave.eid}")
+EOF
+```
+
+### 4.3 运行基本测试
+
+```bash
+# 快速验证
+python experiments/quick_test.py
+
+# ResNet-18 基线测试
+bash teeslice/scripts/run_resnet_baseline.sh
+```
+
+### 4.4 重新编译（修改配置后）
+
+**重要**：修改 `STORE_CHUNK_ELEM` 或 `Enclave.config.xml` 后，必须重新编译：
+
+```bash
+# 完整重新编译命令
+rm -rf SGXDNN/bin_sgx && make clean && make SGX_MODE=HW all
+```
+
+**常用编译命令**：
+
+| 场景 | 命令 |
+|------|------|
+| 普通编译 | `make` |
+| 清理编译 | `make clean && make` |
+| 修改 STORE_CHUNK_ELEM 后 | `rm -rf SGXDNN/bin_sgx && make clean && make SGX_MODE=HW all` |
+| 检查 EDMM 支持 | `make check-edmm` |
+
+---
+
+## 5. 实验指南
+
+### 5.1 实验总览
+
+| 实验 | 脚本 | 输出 |
+|------|------|------|
+| **成本模型测量** | `experiments/measurement/*.py` | JSON 数据 |
+| **分布式推理** | `experiments/models/distributed_resnet.py` | 推理延迟 |
+| **分割策略对比** | `experiments/models/resnet_partition_benchmark.py` | 加速比 |
+
+### 5.2 实验一：成本模型测量
+
+```bash
+cd /root/exp_DNN_SGX/TAOISM
+
+# 快速测试
+python experiments/quick_test.py
+
+# 单模型测量
+python experiments/measurement/measure_computation.py \
+    --single-model NiN \
+    --devices CPU Enclave \
+    --batch-sizes 1 \
+    --iterations 100
+
+# 批量测量（30-60 分钟）
+python experiments/run_all_measurements.py --models NiN ResNet18
+```
+
+**测量类型**：
+
+| 脚本 | 测量内容 | 输出文件 |
+|------|---------|---------|
+| `measure_computation.py` | 每层执行时间 | `computation_cost_*.json` |
+| `measure_communication.py` | 数据传输开销 | `communication_cost_*.json` |
+| `measure_security.py` | CPU vs Enclave 对比 | `security_cost_*.json` |
+| `measure_paging.py` | EPC 换页开销 | `paging_cost_*.json` |
+
+### 5.3 实验二：分布式推理
+
+```bash
+# 运行分布式 ResNet-18 推理
+python -m experiments.models.distributed_resnet
+```
+
+**预期输出**：
+```
+[Topology] Found cut edge: input->conv1 (CPU -> Enclave)
+[Topology] Found cut edge: layer2_block1_relu2->layer3_block0_conv1 (Enclave -> CPU)
+...
+Total Latency: 49.193 ms
+```
+
+### 5.4 实验三：分割策略对比
+
+```bash
+# 运行分割策略基准测试
+python experiments/models/resnet_partition_benchmark.py
+```
+
+**预期输出**：
+```
+================================================================================
+策略                        延迟 (ms)         vs基线
+--------------------------------------------------------------------------------
+all_cpu                         66.468    1.00x
+pipeline_half                   49.193    1.35x  ← 最佳策略
+================================================================================
+```
+
+### 5.5 自定义分割策略
+
+```python
+from experiments.models.distributed_resnet import run_distributed_inference
+from python.utils.basic_utils import ExecutionModeOptions
+
+# 自定义分割：前半在 Enclave，后半在 CPU
+custom_overrides = {
+    "input": ExecutionModeOptions.CPU,  # 必须
+    # Layer3, Layer4 在 CPU
+    **{f"layer{li}_block{bi}_{suffix}": ExecutionModeOptions.CPU
+       for li in [3, 4]
+       for bi in range(2)
+       for suffix in ["conv1", "relu1", "conv2", "skip", "downsample", "add", "relu2"]},
+    "avgpool": ExecutionModeOptions.CPU,
+    "fc": ExecutionModeOptions.CPU,
+    "output": ExecutionModeOptions.CPU,
+}
+
+result = run_distributed_inference(layer_mode_overrides=custom_overrides)
+print(f"延迟: {result['latency_ms']:.3f} ms")
+```
+
+---
+
+## 6. 代码结构
+
+```
+TAOISM/
+│
+├── 📁 experiments/                    # 【核心研究代码】
+│   ├── models/                        # 模型定义与分布式推理
+│   │   ├── sgx_resnet.py              # ⭐ 可分割 ResNet-18
+│   │   ├── distributed_resnet.py      # ⭐ 分布式推理框架
+│   │   ├── resnet_partition_benchmark.py  # 分割策略基准
+│   │   ├── nin.py, vgg16.py, ...      # 其他模型
+│   ├── measurement/                   # 成本测量脚本
+│   ├── data/                          # 输出：测量数据
+│   └── figures/                       # 输出：图表
+│
+├── 📁 python/                         # Python 层接口
+├── 📁 App/                            # Host 端代码
+├── 📁 Enclave/                        # SGX Enclave 代码
+│   └── Enclave.config.xml             # Enclave 内存配置
+├── 📁 SGXDNN/                         # Enclave 内 DNN 算子
+├── 📁 Include/
+│   └── common_with_enclaves.h         # STORE_CHUNK_ELEM 配置
+├── 📁 scripts/                        # 系统脚本
+│   └── check_sgx2_edmm.sh             # 硬件检测
+│
+├── Makefile
+└── README.md
+```
+
+---
+
+## 7. STORE_CHUNK_ELEM 配置参考
+
+`STORE_CHUNK_ELEM` 是 Enclave 内存管理的关键参数，必须根据模型输入尺寸正确配置。
+
+### 7.1 常用模型配置
+
+| 模型 | 输入尺寸 | STORE_CHUNK_ELEM | 说明 |
+|------|---------|------------------|------|
+| **NiN, ResNet18** | 32×32 | 409600 | CIFAR 数据集 |
+| **VGG16, AlexNet** | 224×224 | 802816 | ImageNet |
+| **Inception V3** | 299×299 | 见下表 | 分组配置 |
+
+### 7.2 Inception V3 分组配置
+
+由于 Inception V3 结构复杂，需要分组配置：
+
+| 组名 | STORE_CHUNK_ELEM | 内存/Chunk | 关键约束 |
+|------|-----------------|-----------|---------|
+| **Stem** | 130560500 | 498 MB | MaxPool(35×35, 73×73) |
+| **Inception-A** | 940800 | 3.6 MB | MaxPool(35×35) |
+| **Reduction-A** | 134175475 | 512 MB | MaxPool(35×35, 17×17) |
+| **Inception-B** | 221952 | 0.85 MB | MaxPool(17×17) |
+| **Reduction-B** | 1109760 | 4.2 MB | MaxPool(17×17, 8×8) |
+| **Inception-C** | 30720 | 0.12 MB | MaxPool(8×8) |
+| **Classifier** | 256000 | 0.98 MB | Linear(2048) |
+
+### 7.3 修改 STORE_CHUNK_ELEM
+
+**方法 1：手动编辑**
+
+```bash
+# 编辑配置文件
+vim Include/common_with_enclaves.h
+
+# 修改以下行：
+#define STORE_CHUNK_ELEM 409600
+#define WORK_CHUNK_ELEM 409600
+```
+
+**方法 2：使用 sed 命令**
+
+```bash
+# 设置为 409600（ResNet 32x32）
+sed -i 's/#define STORE_CHUNK_ELEM [0-9]*/#define STORE_CHUNK_ELEM 409600/' Include/common_with_enclaves.h
+sed -i 's/#define WORK_CHUNK_ELEM [0-9]*/#define WORK_CHUNK_ELEM 409600/' Include/common_with_enclaves.h
+
+# 设置为 802816（VGG 224x224）
+sed -i 's/#define STORE_CHUNK_ELEM [0-9]*/#define STORE_CHUNK_ELEM 802816/' Include/common_with_enclaves.h
+sed -i 's/#define WORK_CHUNK_ELEM [0-9]*/#define WORK_CHUNK_ELEM 802816/' Include/common_with_enclaves.h
+```
+
+**方法 3：重新编译（必须）**
+
+```bash
+# 修改配置后必须执行
+rm -rf SGXDNN/bin_sgx && make clean && make SGX_MODE=HW all
+```
+
+### 7.4 约束条件
+
+| 约束类型 | 条件 | 说明 |
+|---------|------|------|
+| **MaxPool（强制）** | `STORE_CHUNK_ELEM % (H × W) == 0` | 不满足会导致错误 |
+| **Conv（警告）** | `STORE_CHUNK_ELEM % (row_size × stride) == 0` | 打印警告但可运行 |
+| **Linear（重要）** | `STORE_CHUNK_ELEM % input_features == 0` | 可能影响性能 |
+
+### 7.5 内存计算
+
+```
+每个 chunk 内存 = STORE_CHUNK_ELEM × 4 bytes (float32)
+总内存 = 8 chunks × 每个 chunk 内存
+```
+
+---
+
+## 8. 故障排除
+
+### 8.1 常见问题
+
+| 问题 | 原因 | 解决方案 |
+|------|------|---------|
+| **Enclave 创建失败** | SGX 驱动未安装 | `ls /dev/sgx_enclave` 验证 |
+| **libstdc++ 版本错误** | Conda 环境库冲突 | 见 8.2 节 |
+| **Out of EPC memory** | Enclave 内存不足 | 调整 `Enclave.config.xml` |
+| **EDMM not detected** | 硬件不支持 SGX2 | 需要 Ice Lake+ CPU |
+| **MaxPool 返回错误** | STORE_CHUNK_ELEM 配置错误 | 见第 7 节 |
+
+### 8.2 libstdc++ 版本冲突
+
+**问题**：
+```
+OSError: libstdc++.so.6: version `GLIBCXX_3.4.32' not found
+```
+
+**解决方案**：
+
+```bash
+# 方案 1：设置正确的 LD_LIBRARY_PATH（推荐）
+export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$SGX_SDK/lib64:$LD_LIBRARY_PATH
+
+# 方案 2：使用 LD_PRELOAD
+export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6
+
+# 方案 3：更新 Conda 环境的 libstdc++
+cp /usr/lib/x86_64-linux-gnu/libstdc++.so.6 $CONDA_PREFIX/lib/
+```
+
+### 8.3 Enclave 内存配置
+
+编辑 `Enclave/Enclave.config.xml`：
+
+```xml
+<EnclaveConfiguration>
+  <!-- 调整堆大小 -->
+  <HeapMaxSize>0x80000000</HeapMaxSize>  <!-- 2GB -->
+  <StackMaxSize>0x2000000</StackMaxSize> <!-- 32MB -->
+  <TCSNum>4</TCSNum>
+</EnclaveConfiguration>
+```
+
+修改后重新编译：
+```bash
+make clean && make
+```
+
+### 8.4 诊断命令
+
+```bash
+# 检查 SGX2/EDMM 支持
+bash scripts/check_sgx2_edmm.sh
+
+# 检查 Enclave 配置
+cat Enclave/Enclave.config.xml
+
+# 监控 EPC 使用
+export PRINT_CHUNK_INFO=1
+python teeslice/sgx_resnet_cifar.py --mode Enclave
+
+# 检查内核 SGX 事件
+sudo dmesg | grep -i sgx
+```
+
+### 8.5 分布式推理常见问题
+
+| 问题 | 解决方案 |
+|------|---------|
+| **"Tags must linked before tensor initialization"** | 使用最新的 `distributed_resnet.py`（共享模型实例） |
+| **"Trying to create tensor with negative dimension"** | 输入尺寸太小，ResNet-18 需要至少 64×64 |
+| **程序卡住** | 可能是死锁，检查依赖关系是否正确 |
+| **LayerA 报 0x1006 错误** | 始终将 `input` 层设为 CPU 模式 |
+
+---
+
+## 9. 主要结果
+
+### 9.1 ResNet-18 分割策略对比
+
+| 策略 | 延迟 (ms) | 加速比 | 说明 |
+|------|-----------|--------|------|
+| `all_cpu` | 66.468 | 1.00× | 基线 |
+| `pipeline_quarter` | 50.391 | 1.32× | 前 1/4 Enclave |
+| `pipeline_half` | **49.193** | **1.35×** | **最优：前 1/2 Enclave** |
+| `pipeline_three_quarter` | 65.184 | 1.02× | 前 3/4 Enclave |
+
+### 9.2 关键发现
+
+1. **分割点选择至关重要**：最佳分割点在网络中间，使两分区负载均衡
+2. **并行结构带来显著加速**：ResNet 残差连接提供天然并行机会
+3. **通信开销可控**：切边数量有限（3 条），通信开销远小于并行收益
+
+---
+
+## 10. 假设与限制
+
+### 10.1 研究假设
+
+- DNN 表示为有向无环图（DAG）
+- 分区粒度为层级
+- 当前支持 CPU/Enclave 两分区
+
+### 10.2 系统限制
+
+| 限制 | 可能的扩展 |
+|------|-----------|
+| 两分区 | 扩展到 CPU/GPU/Enclave 三分区 |
+| ResNet 验证 | 扩展到 Inception、DenseNet |
+| 手动分割 | 自动最优分割算法 |
+
+---
+
+## 11. 引用
+
+本研究基于 TAOISM 框架构建：
+
+```bibtex
+@inproceedings{zhang2024no,
+  title={No Privacy Left Outside: On the (In-)Security of TEE-Shielded DNN Partition for On-Device ML},
   author={Zhang, Ziqi and Gong, Chen and Cai, Yifeng and Yuan, Yuanyuan and Liu, Bingyan and Li, Ding and Guo, Yao and Chen, Xiangqun},
-  journal={arXiv preprint arXiv:2310.07152},
-  year={2023}
+  booktitle={2024 IEEE Symposium on Security and Privacy (SP)},
+  year={2024}
 }
 
 @inproceedings{zhang2022teeslice,
   title={TEESlice: Slicing DNN Models for Secure and Efficient Deployment},
   author={Zhang, Ziqi and Ng, Lucien KL and Liu, Bingyan and Cai, Yifeng and Li, Ding and Guo, Yao and Chen, Xiangqun},
-  booktitle={Proceedings of the 2nd ACM International Workshop on AI and Software Testing/Analysis},
-  pages={1--8},
+  booktitle={AISTA '22},
   year={2022}
 }
 ```
 
+---
 
-- [1. How to Install](#1-how-to-install)
-- [2. How to run](#2-how-to-run)
-- [4. Customize Your Model](#4-customize-your-model)
-- [5. Code Structure](#5-code-structure)
-- [6. Troubleshooting SGX2 EDMM](#6-troubleshooting)
-- [7. Disclaimer](#7-disclaimer)
-- [8. Acknowledgement](#8-acknowledgement)
-
-
-##  1. <a name='HowtoInstall'></a>How to Install
-
-### SGX2 EDMM Requirements
-
-**⚠️ IMPORTANT**: This version of TAOISM uses SGX2 EDMM (Enclave Dynamic Memory Management) features for improved memory efficiency. You need:
-
-- **Hardware**: Intel CPU with SGX2 support (Ice Lake or newer)
-- **Driver**: Intel SGX DCAP driver >= 1.41 (provides `/dev/sgx_enclave` and `/dev/sgx_provision`)
-- **SDK**: Intel SGX SDK >= 2.19 with EDMM API support
-
-### Installation Steps
-
-1. **Install Intel SGX DCAP Driver and SDK**
-
-   For SGX2 EDMM support, install the DCAP driver and SDK 2.19+:
-   
-   ```bash
-   # Install DCAP driver (Ubuntu example)
-   wget https://download.01.org/intel-sgx/latest/linux-latest/distro/ubuntu20.04-server/sgx_linux_x64_driver_*.bin
-   chmod +x sgx_linux_x64_driver_*.bin
-   sudo ./sgx_linux_x64_driver_*.bin
-   
-   # Verify driver installation
-   ls -l /dev/sgx_enclave /dev/sgx_provision
-   
-   # Install SGX SDK 2.19 or newer
-   # Follow instructions at: https://github.com/intel/linux-sgx
-   ```
-
-2. **Check SGX2/EDMM Support**
-
-   Before building, verify your hardware and software support EDMM:
-   
-   ```bash
-   # Run the hardware capability check script
-   bash scripts/check_sgx2_edmm.sh
-   
-   # Or use the Makefile target
-   make check-edmm
-   ```
-   
-   The script will verify:
-   - CPU has SGX2 with Flexible Launch Control (FLC)
-   - DCAP driver devices exist (`/dev/sgx_enclave`, `/dev/sgx_provision`)
-   - SGX SDK version >= 2.19
-   - EDMM API headers are available
-
-3. **Install PyTorch with Python3**
-
-   You may install it using [Anaconda](https://www.anaconda.com/)
-
-   ```bash
-   conda create -n taoism python=3.7
-   conda install pytorch==1.7.0 torchvision==0.8.0 torchaudio==0.7.0 cudatoolkit=11.0 -c pytorch
-   ```
-
-4. **Build the C++ part of this repo**
-
-   ```bash
-   # Source SGX SDK environment
-   source /opt/intel/sgxsdk/environment
-   
-   # Build with SGX2 EDMM support
-   make clean && make
-   ```
-
-**NOTE**: The compilation's `SGX_MODE` is set to `HW` for SGX2 hardware mode. EDMM features are **not available** in simulation mode (`SGX_MODE=SIM`). You must have SGX2-capable hardware to use EDMM. 
-
-
-##  2. <a name='Howtorun'></a>How to run
-1. Source your Intel SGK SDK environment. For example
-
-        source /opt/intel/sgxsdk/environment
-
-2. We provide two scripts (in `teeslice/scripts`) as a demonstration of our framework, you should run the scripts from the **root** directory of this project. (Do not enter the `teeslice` nor `teeslice/scripts` directories.)
-
-- `teeslice/scripts/run_resnet_baseline.sh` can run a ResNet-18 model in three modes (GPU mode, CPU mode, and Enclave mode)
-- `teeslice/scripts/run_teeslice.sh` runs three models trained from TEESlice on CIFAR100 dataset.
-
-
-
-
-##  4. <a name='CustomizeYourModel'></a>Customize Your Model
-
-We implement basic layers for CNN models. You can use these layers to build your own model and customize how to deployment your model. You can put some layers into SGX and the rest of the model to GPU. You can refer to `teeslice/sgx_resnet_cifar.py` and `teeslice/sgx_resnet_cifar_teeslice.py` for an example.
-
-
-For each layer, you can use `EnclaveMode` parameter at initialization to specify how to deploy this layer. 
-| EnclaveMode | Description |
-| --- | --- |
-| EnclaveMode.GPU | Run the layer on GPU |
-| EnclaveMode.ENCLAVE | Run the layer in SGX |
-| EnclaveMode.AUTO | Run the layer in SGX if the input tensor is in SGX, otherwise run on GPU |
-
-
-NOTE: If you want to construct a network of other architectures, you may need to change the memory chunk size in the enclave. Due to the memory limitation of SGX, currently the memory in the SGX is managed in a chunk-based manner. The chunk size is defined in `/Include/common_with_enclaves.h` by `STORE_CHUNK_ELEM` and `WORK_CHUNK_ELEM` (Currently they are the same). For each layer, the framework loads one chunk in the memory and perform the operation on the chunk. 
-
-
-For ResNet, if your input image size is 224x224, the chunk size should be set to 9408. If your input is 32x32, the chunk size should be set to 4704. The criterion to set the chunk size is that it should compatible with the tensor size for each layer during matrix multiplication. For linear layer, the chunk size should be divisible by input channels. For convolution layer, because the current implementation is based on im2col, the chunk size should be divisible $input\_width * input\_channel$ and $output\_channel$ (as the assert statements in `SGXDNN/layers/conv.cpp`).
-
-
-If you want to add new layer (take `linear` as an example) implementation in SGX, you should modify following files:
-- Add the file of python object in `python/layers/sgx_xxx.py`
-- Add the python interface for the initialization, forward, and backward (if you need backward) functions in `python/enclave_interfaces.py`
-- Add the argument type for the python interface in `__init__` function of the object `EnclaveInterface` in `python/enclave_interfaces.py`
-- Add C++ application interface in `App/enclave_bridge.cpp`. The C++ application interface calls the ECALL functions
-- Add ECALL definition in `Enclave/Enclave.edl`
-- Add ECALL implementation in `Enclave/sgxdnn.cpp`. The implementation calls the enclave functions
-- Add the declaration and implementation of enclave functions in `*.hpp` and `*.cpp` files in `SGXDNN/layers/`
-
-
-##  5. <a name='CodeStructure'></a>Code Structure
-
-We summarize the code structure and the functionality of major files/directories to help you understand and reuse the code.
-
-```
-.
-|-- App                             Source code for the untrusted (application) side of the program
-|   |-- bin                         Compiled intermediate binary files
-|   |   |-- enclave_bridge.so       Compiled dynamic library for python lib
-|   |   `-- ...
-|   |-- aes_stream_common.cpp
-|   |-- common_utils.cpp
-|   |-- crypto_common.cpp
-|   |-- enclave_bridge.cpp          Bridge functions for Python interface
-|   |-- Enclave_u.c                 Generated by SGX SDK following Enclave/Enclave.edl
-|   |-- Enclave_u.h                 Generated by SGX SDK following Enclave/Enclave.edl
-|   |-- randpool_common.cpp
-|   `-- sgxaes_common.cpp
-|-- conv2d_extension                Conv2d extention
-|   |-- conv2d_backward.cpp
-|   `-- setup.py
-|-- data                            Cifar10 dataset file
-|   |-- cifar-10-batches-py
-|   `-- cifar-10-python.tar.gz
-|-- Enclave                         Source code for the trusted (enclave) side of the program
-|   |-- bin                         Compiled intermediate binary files
-|   |   |-- Enclave.o
-|   |   `-- ...
-|   |-- Enclave.config.xml
-|   |-- Enclave.cpp
-|   |-- Enclave.edl                 Define Ecalls
-|   |-- Enclave.h
-|   |-- Enclave.lds
-|   |-- Enclave_private.pem
-|   |-- Enclave_t.c                 Generated by SGX SDK following Enclave/Enclave.edl
-|   |-- Enclave_t.h                 Generated by SGX SDK following Enclave/Enclave.edl
-|   `-- sgxdnn.cpp                  Declare ecalls 
-|-- Include                         Header files for the trusted side, needed by Enclave/ and SGXDNN/
-|   |-- eigen                       Eigen library
-|   |-- eigen3_sgx                  Eigen library
-|   |-- aes_stream_common.hpp
-|   |-- sgxdnn_common.hpp
-|   `-- ...
-|-- lib
-|-- python                          Python files
-|   |-- layers                      Python implementation of each layer
-|   |   |-- batch_norm_2d.py        Perform BN in SGX
-|   |   |-- relu.py                 Perform ReLU in SGX
-|   |   |-- sgx_conv_base.py        Perform convolution in SGX
-|   |   |-- sgx_linear_base.py      Perform linear in SGX
-|   |   `-- ...
-|   |-- test                        Test files for each layer
-|   |   |-- connect_c.py            Test basic functionalities and interface between Enclave and App
-|   |   |-- test_bn.py
-|   |   |-- test_conv.py
-|   |   |-- test_maxpool.py
-|   |   `-- test_relu.py
-|   |-- utils
-|   |-- common_net.py
-|   |-- common_torch.py
-|   |-- enclave_interfaces.py       Interface of bridge functions between the untrusted (application) side and python
-|   |-- sgx_net.py                  Build the whole network using a list of layers
-|   |-- tensor_loader.py            Tensor manager in python
-|   `-- ...
-|-- SGXDNN                          DNN part in the trusted (enclave) side
-|   |-- bin_sgx                     Compiled intermediate binary files
-|   |   |-- layers
-|   |   |-- aes-stream.o
-|   |   `-- ...
-|   |-- layers                      C++ implementation for each layer in
-|   |   |-- batchnorm.cpp
-|   |   |-- batchnorm.hpp
-|   |   |-- conv.cpp
-|   |   |-- conv.hpp
-|   |   |-- linear.cpp
-|   |   |-- linear.hpp
-|   |   |-- maxpool.cpp
-|   |   `-- maxpool.hpp
-|   |-- aes-stream.cpp
-|   |-- aes-stream.hpp
-|   |-- chunk_manager.cpp           Manage memory chunks in the enclave
-|   |-- chunk_manager.hpp
-|   |-- Crypto.cpp
-|   |-- Crypto.h
-|   |-- randpool.hpp
-|   |-- secret_tensor.cpp           Tensor management in the enclave
-|   |-- secret_tensor.hpp
-|   |-- sgxaes_asm.S
-|   |-- sgxaes.cpp
-|   |-- sgxaes.h
-|   |-- sgxdnn_main.cpp             Main file in the enclave
-|   |-- sgxdnn_main.hpp
-|   |-- stochastic.cpp
-|   |-- stochastic.hpp
-|   |-- utils.cpp
-|   |-- utils.hpp
-|   |-- xoshiro.cpp
-|   `-- xoshiro.hpp
-|-- teeslice                        Code for TEESlice
-|   |-- cifar10val                  Trained model checkpoints on CIFAR dataset
-|   |   |-- cifar100-resnet18
-|   |   |-- cifar100-resnet50
-|   |   |-- iterative-teeslice-[cifar100-resnet18]
-|   |   `-- iterative-teeslice-[cifar100-resnet50]
-|   |-- scripts                     Scripts
-|   |   |-- run_resnet_baseline.sh
-|   |   `-- run_teeslice.sh
-|   |-- eval_sgx_teeslice.py
-|   |-- GUIDE.md
-|   |-- resnet18_enclave_cpu_time.py
-|   |-- resnet_cifar.py             ResNet for CIFAR, input image 32x32
-|   |-- resnet.py                   ResNet implemntation from Pytorch, input image 224x224
-|   |-- sgx_resnet_cifar.py         Put all ResNet layers in SGX
-|   |-- sgx_resnet_cifar_teeslice.py    Put the private slices of TEESlice's ResNet in SGX and put the backbone on GPU 
-|   |-- sgx_resnet.py               Put all CIFAR ResNet layers in SGX
-|   |-- student_resnet_cifar.py     TEESLice's ResNet with private slices
-|   `-- utils.py
-|-- enclave.signed.so
-|-- enclave.so                      Dynamic library of enclave code
-|-- taoism_app                       Compiled application
-|-- LICENSE
-|-- logfile.log
-|-- Makefile                        Makefile to compile the C/C++ part
-|-- README.md
-`-- ...
-
-
-```
-
-##  6. <a name='Troubleshooting'></a>Troubleshooting SGX2 EDMM
-
-### Common Issues and Solutions
-
-#### 1. "Failed to create enclave" error
-
-**Symptoms**: Enclave initialization fails with SGX error codes.
-
-**Solutions**:
-- Verify SGX2 is enabled in BIOS settings
-- Check driver installation: `ls -l /dev/sgx_enclave`
-- Run capability check: `bash scripts/check_sgx2_edmm.sh`
-- Ensure no other enclaves are consuming all EPC memory
-
-#### 2. "EDMM features not detected" warning
-
-**Symptoms**: Warning message about EDMM not being available despite successful enclave creation.
-
-**Solutions**:
-- Your CPU may support SGX but not SGX2/EDMM
-- Check CPU specifications for SGX2 support (Ice Lake or newer)
-- Verify SDK version >= 2.19: `cat $SGX_SDK/version`
-- Enclave will fall back to static memory allocation (still functional)
-
-#### 3. "Out of EPC memory" errors
-
-**Symptoms**: Runtime errors about EPC exhaustion, especially with large models.
-
-**Solutions**:
-- Adjust `HeapMaxSize` and `ReservedMemMaxSize` in `Enclave/Enclave.config.xml`
-- Reduce `STORE_CHUNK_ELEM` in `Include/common_with_enclaves.h`
-- Enable aggressive decommit in `SGXDNN/chunk_manager.cpp` (see comments)
-- Close other SGX applications to free EPC
-
-#### 4. Compilation errors with sgx_create_enclave_ex
-
-**Symptoms**: Undefined reference to `sgx_create_enclave_ex` or related symbols.
-
-**Solutions**:
-- Update SGX SDK to version 2.19 or higher
-- Check that `$SGX_SDK/lib64` contains updated libraries
-- Re-source the SGX environment: `source $SGX_SDK/environment`
-- Clean and rebuild: `make clean && make`
-
-#### 5. Performance degradation compared to SGX1
-
-**Symptoms**: Slower inference times after EDMM migration.
-
-**Solutions**:
-- EDMM page commits have overhead; adjust chunk sizes
-- Enable lazy decommit (keep pages committed, default behavior)
-- Profile EPC page faults: `sudo perf stat -e sgx:*`
-- Consider pre-committing frequently used chunks
-
-#### 6. Legacy driver (/dev/isgx) detected
-
-**Symptoms**: Check script warns about old driver.
-
-**Solutions**:
-- Uninstall old driver: `sudo rmmod isgx`
-- Install DCAP driver following Intel's latest instructions
-- Reboot system after driver update
-- Verify new devices: `ls -l /dev/sgx_*`
-
-### Monitoring EDMM Performance
-
-To monitor EDMM memory usage during inference:
+## 附录 A：快速命令参考
 
 ```bash
-# Enable EDMM statistics printing
-export PRINT_CHUNK_INFO=1
+# ========== 环境激活 ==========
+source /opt/intel/sgxsdk/environment
+export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$SGX_SDK/lib64:$LD_LIBRARY_PATH
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate taoism
 
-# Run your model
-python teeslice/eval_sgx_teeslice.py
+# ========== 编译 ==========
+make                                          # 普通编译
+make clean && make                            # 清理编译
+rm -rf SGXDNN/bin_sgx && make clean && make SGX_MODE=HW all  # 完整重编译
 
-# Check kernel logs for EPC events
-sudo dmesg | grep -i sgx
+# ========== 测试 ==========
+python experiments/quick_test.py              # 快速验证
+bash teeslice/scripts/run_resnet_baseline.sh  # ResNet 基线
+
+# ========== 实验 ==========
+python -m experiments.models.distributed_resnet              # 分布式推理
+python experiments/models/resnet_partition_benchmark.py      # 分割策略对比
+python experiments/run_all_measurements.py --quick-test      # 成本测量
+
+# ========== 诊断 ==========
+bash scripts/check_sgx2_edmm.sh               # 检查 SGX2 支持
+cat Enclave/Enclave.config.xml                # 查看 Enclave 配置
+cat Include/common_with_enclaves.h | grep CHUNK  # 查看 chunk 配置
 ```
 
-##  7. <a name='Disclaimer'></a>Disclaimer
-DO NOT USE THIS SOFTWARE TO SECURE ANY REAL-WORLD DATA OR COMPUTATION!
+## 附录 B：文件索引
 
-This software is a proof-of-concept meant for performance testing of the TAOISM framework ONLY. It is full of security vulnerabilities that facilitate testing, debugging and performance measurements. In any real-world deployment, these vulnerabilities can be easily exploited to leak all user inputs.
+| 目的 | 文件位置 |
+|------|---------|
+| **分布式推理框架** | `experiments/models/distributed_resnet.py` |
+| **可分割 ResNet** | `experiments/models/sgx_resnet.py` |
+| **分割策略基准** | `experiments/models/resnet_partition_benchmark.py` |
+| **成本测量脚本** | `experiments/measurement/*.py` |
+| **Chunk 配置** | `Include/common_with_enclaves.h` |
+| **Enclave 配置** | `Enclave/Enclave.config.xml` |
+| **硬件检测** | `scripts/check_sgx2_edmm.sh` |
 
-Some parts that have a negligble impact on performance but that are required for a real-world deployment are not currently implemented (e.g., setting up a secure communication channel with a remote client and producing verifiable attestations).
+---
 
-##  8. <a name='Acknowledgement'></a>Acknowledgement
-The framework is based on the code of Goten (Lucien K. L. Ng, 2021) and Slalom (Tramer & Boneh, 2019).
+<p align="center">
+  <em>Last Updated: December 2025</em>
+</p>
