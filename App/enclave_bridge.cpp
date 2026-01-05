@@ -235,8 +235,18 @@ void ocall_print_edmm_stats(
     printf("\n");
 }
 
+// Track host-side buffers allocated by ocall_allocate_mem so we can free them when
+// the enclave is destroyed. Without this, repeated enclave init/destroy (e.g. per-layer
+// profiling) leaks untrusted memory and eventually crashes.
+static std::mutex g_ocall_alloc_mutex;
+static std::vector<void*> g_ocall_allocated_ptrs;
+
 void* ocall_allocate_mem(int num_byte) {
     void* res = (void*)malloc(num_byte);
+    if (res != nullptr) {
+        std::unique_lock<std::mutex> lock(g_ocall_alloc_mutex);
+        g_ocall_allocated_ptrs.push_back(res);
+    }
     return res;
 }
 
@@ -396,6 +406,20 @@ extern "C"
     {
         std::cout << "Destroying Enclave with id: " << eid << std::endl;
         sgx_destroy_enclave(eid);
+
+        // Free all untrusted buffers that were allocated via ocall_allocate_mem.
+        // These buffers are only used as backing storage for encrypted chunks; once the enclave
+        // is destroyed they are unreachable (the enclave's in-enclave mapping is gone), so we
+        // must reclaim them to avoid an unbounded host-memory leak across repeated enclave
+        // init/destroy cycles (e.g., layer-by-layer profiling).
+        {
+            std::unique_lock<std::mutex> lock(g_ocall_alloc_mutex);
+            for (void* p : g_ocall_allocated_ptrs) {
+                free(p);
+            }
+            g_ocall_allocated_ptrs.clear();
+            g_ocall_allocated_ptrs.shrink_to_fit();
+        }
     }
 
 
@@ -663,6 +687,121 @@ extern "C"
 
     void SGXConvForward(EidT eid, uint64_t FunId) {
         sgx_status_t ret = ecall_sgx_conv_forward(eid, FunId);
+        if (ret != SGX_SUCCESS) { print_error_message(ret, __func__); throw ret; }
+    }
+
+    // =========================================================================
+    // LayerNorm Layer
+    // =========================================================================
+    void InitLayernorm(
+            EidT eid,
+            IdT FunId,
+            IdT input, IdT output, IdT gamma, IdT beta,
+            uint32_t batch_, uint32_t seq_len_, uint32_t embed_dim_,
+            float epsilon_) {
+
+        sgx_status_t ret = ecall_init_layernorm(
+                eid, FunId,
+                input, output, gamma, beta,
+                batch_, seq_len_, embed_dim_,
+                epsilon_);
+        if (ret != SGX_SUCCESS) { print_error_message(ret, __func__); throw ret; }
+    }
+
+    void LayernormForward(EidT eid, uint64_t FunId) {
+        sgx_status_t ret = ecall_layernorm_forward(eid, FunId);
+        if (ret != SGX_SUCCESS) { print_error_message(ret, __func__); throw ret; }
+    }
+
+    // =========================================================================
+    // Softmax Layer
+    // =========================================================================
+    void InitSoftmax(
+            EidT eid,
+            IdT FunId,
+            IdT input, IdT output,
+            uint32_t total_elements_, uint32_t softmax_dim_) {
+
+        sgx_status_t ret = ecall_init_softmax(
+                eid, FunId,
+                input, output,
+                total_elements_, softmax_dim_);
+        if (ret != SGX_SUCCESS) { print_error_message(ret, __func__); throw ret; }
+    }
+
+    void SoftmaxForward(EidT eid, uint64_t FunId) {
+        sgx_status_t ret = ecall_softmax_forward(eid, FunId);
+        if (ret != SGX_SUCCESS) { print_error_message(ret, __func__); throw ret; }
+    }
+
+    // =========================================================================
+    // GELU Activation Layer
+    // =========================================================================
+    void InitGELU(
+            EidT eid,
+            IdT FunId,
+            IdT input, IdT output,
+            uint32_t num_elements_, int use_approximate_) {
+
+        sgx_status_t ret = ecall_init_gelu(
+                eid, FunId,
+                input, output,
+                num_elements_, use_approximate_);
+        if (ret != SGX_SUCCESS) { print_error_message(ret, __func__); throw ret; }
+    }
+
+    void GELUForward(EidT eid, uint64_t FunId) {
+        sgx_status_t ret = ecall_gelu_forward(eid, FunId);
+        if (ret != SGX_SUCCESS) { print_error_message(ret, __func__); throw ret; }
+    }
+
+    // =========================================================================
+    // MatMul (Batch Matrix Multiplication) Layer
+    // =========================================================================
+    void InitMatMul(
+            EidT eid,
+            IdT FunId,
+            IdT input1, IdT input2, IdT output,
+            uint32_t batch_, uint32_t num_heads_, uint32_t seq_len_,
+            uint32_t dim1_, uint32_t dim2_,
+            int transpose_a_, int transpose_b_,
+            float scale_) {
+
+        sgx_status_t ret = ecall_init_matmul(
+                eid, FunId,
+                input1, input2, output,
+                batch_, num_heads_, seq_len_,
+                dim1_, dim2_,
+                transpose_a_, transpose_b_,
+                scale_);
+        if (ret != SGX_SUCCESS) { print_error_message(ret, __func__); throw ret; }
+    }
+
+    void MatMulForward(EidT eid, uint64_t FunId) {
+        sgx_status_t ret = ecall_matmul_forward(eid, FunId);
+        if (ret != SGX_SUCCESS) { print_error_message(ret, __func__); throw ret; }
+    }
+
+    // =========================================================================
+    // Layer runtime stats (profiling)
+    // =========================================================================
+    void GetLayerRuntimeStats(
+            EidT eid,
+            uint64_t FunId,
+            double* get_ms,
+            double* compute_ms,
+            double* store_ms,
+            double* get2_ms,
+            double* store2_ms,
+            int32_t* num_inputs) {
+        sgx_status_t ret = ecall_get_layer_runtime_stats(
+                eid, FunId,
+                get_ms,
+                compute_ms,
+                store_ms,
+                get2_ms,
+                store2_ms,
+                num_inputs);
         if (ret != SGX_SUCCESS) { print_error_message(ret, __func__); throw ret; }
     }
 }

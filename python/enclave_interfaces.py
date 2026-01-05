@@ -1,5 +1,6 @@
 from collections import defaultdict
 from ctypes import c_uint8, c_ulong, c_ulonglong, c_uint64, c_float, c_ubyte, cdll, POINTER, c_int, c_uint, c_uint32, c_bool
+from ctypes import c_double, c_int32
 
 import numpy as np
 import torch
@@ -219,7 +220,12 @@ class GlobalTensor(object):
 
 
 def get_float_ptr(x):
-    return x.detach().numpy().ctypes.data_as(EnclaveInterface.ArrToEnclaveT)
+    # WARNING:
+    # If x is non-contiguous, x.detach().numpy() will materialize a temporary numpy copy.
+    # Returning a pointer to that temporary without holding a reference can cause use-after-free.
+    # Prefer using EnclaveInterface.set_tensor/get_tensor which keep the numpy buffer alive
+    # across the ECALL boundary.
+    return x.detach().cpu().contiguous().numpy().ctypes.data_as(EnclaveInterface.ArrToEnclaveT)
 
 
 def get_encryption_ptr(x):
@@ -258,6 +264,15 @@ class EnclaveInterface(object):
         self.lib.GetRandom.argtypes = [self.EidT, self.IdT, self.ArrToEnclaveT, c_ulonglong]
         self.lib.AsyncGetRandom.argtypes = self.lib.GetRandom.argtypes
         self.lib.AsyncGetRandom.restype = self.TaskIdT
+
+        # Layer runtime stats (profiling)
+        # void GetLayerRuntimeStats(eid, FunId, &get_ms, &compute_ms, &store_ms, &get2_ms, &store2_ms, &num_inputs)
+        self.lib.GetLayerRuntimeStats.argtypes = [
+            self.EidT, self.IdT,
+            POINTER(c_double), POINTER(c_double), POINTER(c_double),
+            POINTER(c_double), POINTER(c_double),
+            POINTER(c_int32)
+        ]
         self.lib.SgdUpdate.argtypes = [self.EidT] + [self.IdT] * 3 + [c_float] * 4 + [c_bool] * 2
         self.lib.AsyncSgdUpdate.argtypes = [self.EidT] + [self.IdT] * 3 + [c_float] * 4 + [c_bool] * 2
         self.lib.AsyncSgdUpdate.restype = self.TaskIdT
@@ -286,6 +301,23 @@ class EnclaveInterface(object):
         self.lib.SGXLinearForward.argtypes = [self.EidT, self.IdT]
         self.lib.InitSGXConv.argtypes = [self.EidT] + [self.IdT] * 5 + [c_uint32] * 10
         self.lib.SGXConvForward.argtypes = [self.EidT, self.IdT]
+
+        # Transformer-specific layers
+        # LayerNorm: (eid, FunId, input, output, gamma, beta, batch, seq_len, embed_dim, epsilon)
+        self.lib.InitLayernorm.argtypes = [self.EidT] + [self.IdT] * 5 + [c_uint32] * 3 + [c_float]
+        self.lib.LayernormForward.argtypes = [self.EidT, self.IdT]
+        
+        # Softmax: (eid, FunId, input, output, total_elements, softmax_dim)
+        self.lib.InitSoftmax.argtypes = [self.EidT] + [self.IdT] * 3 + [c_uint32] * 2
+        self.lib.SoftmaxForward.argtypes = [self.EidT, self.IdT]
+        
+        # GELU: (eid, FunId, input, output, num_elements, use_approximate)
+        self.lib.InitGELU.argtypes = [self.EidT] + [self.IdT] * 3 + [c_uint32] + [c_int]
+        self.lib.GELUForward.argtypes = [self.EidT, self.IdT]
+        
+        # MatMul: (eid, FunId, input1, input2, output, batch, num_heads, seq_len, dim1, dim2, trans_a, trans_b, scale)
+        self.lib.InitMatMul.argtypes = [self.EidT] + [self.IdT] * 4 + [c_uint32] * 5 + [c_int] * 2 + [c_float]
+        self.lib.MatMulForward.argtypes = [self.EidT, self.IdT]
 
         self.deployed_name_seed = defaultdict(list)
 
@@ -340,9 +372,22 @@ class EnclaveInterface(object):
         # self.lib.InitTensor(self.GetEid(), self.GetTag(name), size[0], size[1], size[2], size[3])
 
     def set_tensor_unsafe(self, tag, tensor):
-        # if len(tensor.shape)>1:
-        #     print(f"Set tag {tag}, ", tensor[0,:10])
-        self.lib.SetTen(self.get_eid(), tag, get_float_ptr(tensor))
+        # CRITICAL: When tags are linked, we must use the remapped (leader) tag
+        # for both InitTensor and SetTen; otherwise enclave-side GetTenById(non-leader)
+        # will return nullptr and crash (0x1006).
+        remapped_tag = GlobalTensor.get_remapped_tags(tag)
+        
+        # Ensure the enclave tensor exists before SetTen
+        if remapped_tag not in GlobalTensor.IsInitEnclaveTensor:
+            GlobalTensor.init_enclave_tensor(remapped_tag, list(tensor.shape))
+
+        # Ensure a stable, contiguous CPU buffer and keep the numpy object alive
+        # for the duration of the ECALL.
+        t_cpu = tensor.detach().to(torch.device("cpu")).contiguous()
+        np_buf = t_cpu.numpy()
+        ptr = np_buf.ctypes.data_as(EnclaveInterface.ArrToEnclaveT)
+        # ALWAYS use remapped_tag when calling enclave
+        self.lib.SetTen(self.get_eid(), remapped_tag, ptr)
 
     def set_tensor(self, name, tensor):
         # if len(tensor.shape)>1:
@@ -354,7 +399,17 @@ class EnclaveInterface(object):
         self.set_tensor(name, tensor)
 
     def get_tensor(self, name, tensor):
-        self.lib.GetTen(self.get_eid(), self.get_tag(name), get_float_ptr(tensor))
+        # CRITICAL: Use remapped tag for GetTen to match enclave-side TenId
+        remapped_tag = GlobalTensor.get_remapped_tags(self.get_tag(name))
+        
+        # Keep a stable destination buffer for the duration of the ECALL.
+        t_cpu = tensor.detach().to(torch.device("cpu")).contiguous()
+        np_buf = t_cpu.numpy()
+        ptr = np_buf.ctypes.data_as(EnclaveInterface.ArrToEnclaveT)
+        self.lib.GetTen(self.get_eid(), remapped_tag, ptr)
+        # Copy back into the provided tensor if it was not the same object.
+        if t_cpu.data_ptr() != tensor.data_ptr():
+            tensor.copy_(t_cpu)
 
     def get_enclave_tensor(self, name, tensor):
         self.get_tensor(name, tensor)
@@ -579,6 +634,120 @@ class EnclaveInterface(object):
         self.lib.SGXConvForward(
             self.get_eid(), self.get_tag(layer_name),
         )
+
+    # =========================================================================
+    # LayerNorm Layer Interface
+    # =========================================================================
+    def layernorm_init(
+        self, layer_name,
+        input_name, output_name, gamma_name, beta_name,
+        batch_size, seq_len, embed_dim,
+        epsilon=1e-5
+    ):
+        self.lib.InitLayernorm(
+            self.get_eid(), self.get_tag(layer_name),
+            self.get_tag(input_name), self.get_tag(output_name),
+            self.get_tag(gamma_name), self.get_tag(beta_name),
+            batch_size, seq_len, embed_dim,
+            c_float(epsilon)
+        )
+
+    def layernorm_forward(self, layer_name):
+        self.lib.LayernormForward(
+            self.get_eid(), self.get_tag(layer_name),
+        )
+
+    # =========================================================================
+    # Softmax Layer Interface
+    # =========================================================================
+    def softmax_init(
+        self, layer_name,
+        input_name, output_name,
+        total_elements, softmax_dim
+    ):
+        self.lib.InitSoftmax(
+            self.get_eid(), self.get_tag(layer_name),
+            self.get_tag(input_name), self.get_tag(output_name),
+            total_elements, softmax_dim
+        )
+
+    def softmax_forward(self, layer_name):
+        self.lib.SoftmaxForward(
+            self.get_eid(), self.get_tag(layer_name),
+        )
+
+    # =========================================================================
+    # GELU Activation Layer Interface
+    # =========================================================================
+    def gelu_init(
+        self, layer_name,
+        input_name, output_name,
+        num_elements, use_approximate=1
+    ):
+        self.lib.InitGELU(
+            self.get_eid(), self.get_tag(layer_name),
+            self.get_tag(input_name), self.get_tag(output_name),
+            num_elements, use_approximate
+        )
+
+    def gelu_forward(self, layer_name):
+        self.lib.GELUForward(
+            self.get_eid(), self.get_tag(layer_name),
+        )
+
+    # =========================================================================
+    # MatMul (Batch Matrix Multiplication) Layer Interface
+    # =========================================================================
+    def matmul_init(
+        self, layer_name,
+        input1_name, input2_name, output_name,
+        batch, num_heads, seq_len,
+        dim1, dim2,
+        transpose_a=0, transpose_b=0,
+        scale=1.0
+    ):
+        self.lib.InitMatMul(
+            self.get_eid(), self.get_tag(layer_name),
+            self.get_tag(input1_name), self.get_tag(input2_name), self.get_tag(output_name),
+            batch, num_heads, seq_len,
+            dim1, dim2,
+            transpose_a, transpose_b,
+            c_float(scale)
+        )
+
+    def matmul_forward(self, layer_name):
+        self.lib.MatMulForward(
+            self.get_eid(), self.get_tag(layer_name),
+        )
+
+    def get_layer_runtime_stats(self, layer_name):
+        """
+        Fetch last-forward runtime stats for a layer (times in ms).
+
+        Returns:
+            dict with keys: get_ms, compute_ms, store_ms, get2_ms, store2_ms, num_inputs
+        """
+        get_ms = c_double(0.0)
+        compute_ms = c_double(0.0)
+        store_ms = c_double(0.0)
+        get2_ms = c_double(0.0)
+        store2_ms = c_double(0.0)
+        num_inputs = c_int32(0)
+
+        self.lib.GetLayerRuntimeStats(
+            self.get_eid(), self.get_tag(layer_name),
+            get_ms, compute_ms, store_ms,
+            get2_ms, store2_ms,
+            num_inputs
+        )
+        return {
+            "get_ms": float(get_ms.value),
+            "compute_ms": float(compute_ms.value),
+            "store_ms": float(store_ms.value),
+            "get2_ms": float(get2_ms.value),
+            "store2_ms": float(store2_ms.value),
+            "num_inputs": int(num_inputs.value),
+        }
 
     @staticmethod
     def print_tensor_link_relation():

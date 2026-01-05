@@ -130,3 +130,102 @@ void ecall_init_sgx_conv(
 void ecall_sgx_conv_forward(uint64_t FunId) {
     SecretSGXConvForward(FunId);
 }
+
+// ============================================================================
+// LayerNorm Layer
+// ============================================================================
+void ecall_init_layernorm(
+        uint64_t FunId,
+        uint64_t input, uint64_t output, uint64_t gamma, uint64_t beta,
+        uint32_t batch_, uint32_t seq_len_, uint32_t embed_dim_,
+        float epsilon_) {
+
+    SecretInitLayernorm(
+            FunId,
+            input, output, gamma, beta,
+            batch_, seq_len_, embed_dim_,
+            epsilon_);
+}
+
+void ecall_layernorm_forward(uint64_t FunId) {
+    SecretLayernormForward(FunId);
+}
+
+// ============================================================================
+// Softmax Layer
+// ============================================================================
+void ecall_init_softmax(
+        uint64_t FunId,
+        uint64_t input, uint64_t output,
+        uint32_t total_elements_, uint32_t softmax_dim_) {
+
+    SecretInitSoftmax(
+            FunId,
+            input, output,
+            total_elements_, softmax_dim_);
+}
+
+void ecall_softmax_forward(uint64_t FunId) {
+    SecretSoftmaxForward(FunId);
+}
+
+// ============================================================================
+// GELU Activation Layer
+// ============================================================================
+void ecall_init_gelu(
+        uint64_t FunId,
+        uint64_t input, uint64_t output,
+        uint32_t num_elements_, int use_approximate_) {
+
+    SecretInitGELU(
+            FunId,
+            input, output,
+            num_elements_, use_approximate_);
+}
+
+void ecall_gelu_forward(uint64_t FunId) {
+    SecretGELUForward(FunId);
+}
+
+// ============================================================================
+// MatMul Layer
+// ============================================================================
+void ecall_init_matmul(
+        uint64_t FunId,
+        uint64_t input1, uint64_t input2, uint64_t output,
+        uint32_t batch_, uint32_t num_heads_, uint32_t seq_len_,
+        uint32_t dim1_, uint32_t dim2_,
+        int transpose_a_, int transpose_b_,
+        float scale_) {
+
+    SecretInitMatMul(
+            FunId,
+            input1, input2, output,
+            batch_, num_heads_, seq_len_,
+            dim1_, dim2_,
+            transpose_a_, transpose_b_,
+            scale_);
+}
+
+void ecall_matmul_forward(uint64_t FunId) {
+    SecretMatMulForward(FunId);
+}
+
+void ecall_get_layer_runtime_stats(
+        uint64_t FunId,
+        double* get_ms,
+        double* compute_ms,
+        double* store_ms,
+        double* get2_ms,
+        double* store2_ms,
+        int32_t* num_inputs) {
+    SecretGetLayerRuntimeStats(
+        FunId,
+        get_ms,
+        compute_ms,
+        store_ms,
+        get2_ms,
+        store2_ms,
+        num_inputs
+    );
+}

@@ -94,19 +94,59 @@ class SecretMatMulLayer(SecretNonlinearLayer):
     def init(self, start_enclave=True):
         """Initialize the layer."""
         TensorLoader.init(self, start_enclave)
+        
+        if self.EnclaveMode is ExecutionModeOptions.Enclave:
+            import numpy as np
+            
+            # Get dimensions for matmul
+            # InputShape1 and InputShape2 are typically (batch, num_heads, seq_len, head_dim)
+            if len(self.InputShape1) == 4:
+                batch = self.InputShape1[0]
+                num_heads = self.InputShape1[1]
+                seq_len = self.InputShape1[2]
+                dim1 = self.InputShape1[3]
+                dim2 = self.InputShape2[3]
+            elif len(self.InputShape1) == 3:
+                batch = self.InputShape1[0]
+                num_heads = 1
+                seq_len = self.InputShape1[1]
+                dim1 = self.InputShape1[2]
+                dim2 = self.InputShape2[2]
+            elif len(self.InputShape1) == 2:
+                batch = 1
+                num_heads = 1
+                seq_len = self.InputShape1[0]
+                dim1 = self.InputShape1[1]
+                dim2 = self.InputShape2[1]
+            else:
+                raise ValueError(f"Unsupported InputShape for MatMul: {self.InputShape1}")
+            
+            # Initialize native enclave MatMul
+            self.matmul_init(
+                self.LayerName,
+                "input1", "input2", "output",
+                batch, num_heads, seq_len,
+                dim1, dim2,
+                1 if self.transpose_a else 0,
+                1 if self.transpose_b else 0,
+                self.scale if self.scale is not None else 1.0
+            )
     
     def get_output_shape(self):
         return self.OutputShape
     
     def generate_tensor_name_list(self, force=False):
-        """Generate list of tensors needed for this layer."""
+        """Generate list of tensors needed for this layer.
+        
+        Note: input1/input2 will be linked to previous layers' outputs via link_tensors(),
+        so we only need to declare output here. The linked tags will be initialized
+        by the previous layers' init() calls.
+        """
         if not force and self.tensor_name_list:
             return
         
+        # Only declare output tensor; input1/input2 come from linked previous layers
         NeededTensorNames = [
-            ("input1", self.InputShape1, None),
-            ("input2", self.InputShape2, None),
-            ("input", self.InputShape1, None),  # Alias for compatibility
             ("output", self.OutputShape, None),
         ]
         
@@ -142,20 +182,10 @@ class SecretMatMulLayer(SecretNonlinearLayer):
             prev0_mode = self.PrevLayer[0].EnclaveMode
             prev1_mode = self.PrevLayer[1].EnclaveMode
             
-            if prev0_mode == ExecutionModeOptions.Enclave and prev1_mode == ExecutionModeOptions.Enclave:
-                # Both inputs from Enclave
-                with NamedTimerInstance(f"  S{self.sid}: {self.LayerName} Enclave->CPU", verbose_level=VerboseLevel.LAYER):
-                    self.transfer_enclave_to_cpu("input1")
-                    self.transfer_enclave_to_cpu("input2")
-                
-                with NamedTimerInstance(f"  S{self.sid}: {self.LayerName} CPU Compute", verbose_level=VerboseLevel.LAYER):
-                    input1 = self.get_cpu("input1")
-                    input2 = self.get_cpu("input2")
-                    output = self._matmul_cpu(input1, input2)
-                    self.set_cpu("output", output)
-                
-                with NamedTimerInstance(f"  S{self.sid}: {self.LayerName} CPU->Enclave", verbose_level=VerboseLevel.LAYER):
-                    self.transfer_cpu_to_enclave("output")
+            if self.EnclaveMode == ExecutionModeOptions.Enclave and prev0_mode == ExecutionModeOptions.Enclave and prev1_mode == ExecutionModeOptions.Enclave:
+                # Native Enclave execution - both inputs are already in enclave
+                with NamedTimerInstance(f"  S{self.sid}: {self.LayerName} matmul_forward", verbose_level=VerboseLevel.LAYER):
+                    self.matmul_forward(self.LayerName)
                     
             elif prev0_mode == ExecutionModeOptions.CPU and prev1_mode == ExecutionModeOptions.CPU:
                 # Both inputs from CPU
@@ -181,7 +211,7 @@ class SecretMatMulLayer(SecretNonlinearLayer):
                 self.set_gpu("output", output)
                 
             else:
-                # Mixed modes - transfer all to CPU
+                # Mixed modes - transfer all to CPU and compute
                 if prev0_mode == ExecutionModeOptions.Enclave:
                     self.transfer_enclave_to_cpu("input1")
                 elif prev0_mode == ExecutionModeOptions.GPU:
@@ -219,5 +249,6 @@ class SecretMatMulLayer(SecretNonlinearLayer):
         prev_names = [p.LayerName for p in self.PrevLayer] if self.PrevLayer else []
         next_name = self.NextLayer.LayerName if self.NextLayer else "None"
         print(f"{self.LayerName:20} shape{self.OutputShape} mode{self.EnclaveMode} input {prev_names} output {next_name}")
+
 
 

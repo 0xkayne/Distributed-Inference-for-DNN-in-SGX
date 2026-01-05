@@ -72,8 +72,16 @@ class SecretGELULayer(SecretActivationLayer):
         TensorLoader.init(self, start_enclave)
         
         if self.EnclaveMode is ExecutionModeOptions.Enclave:
-            # TODO: Initialize native enclave GELU when implemented
-            pass
+            # Calculate num_elements
+            import numpy as np
+            num_elements = int(np.prod(self.InputShape))
+            
+            # Initialize native enclave GELU
+            self.gelu_init(
+                self.LayerName,
+                "input", "output",
+                num_elements, 1 if self.approximate else 0
+            )
         elif self.EnclaveMode is ExecutionModeOptions.GPU:
             # Nothing special needed for GPU
             pass
@@ -124,35 +132,24 @@ class SecretGELULayer(SecretActivationLayer):
         """Forward pass."""
         with NamedTimerInstance(f"S{self.sid}: {self.LayerName} Forward", verbose_level=VerboseLevel.LAYER):
             if self.EnclaveMode == ExecutionModeOptions.Enclave:
-                # For Enclave mode: transfer to CPU, compute, transfer back
-                with NamedTimerInstance(f"  S{self.sid}: {self.LayerName} Enclave->CPU", verbose_level=VerboseLevel.LAYER):
+                # Native Enclave execution
+                with NamedTimerInstance(f"  S{self.sid}: {self.LayerName} Input Preprocess", verbose_level=VerboseLevel.LAYER):
                     self.forward_tensor_transfer()
-                    self.transfer_enclave_to_cpu("input")
-                
-                with NamedTimerInstance(f"  S{self.sid}: {self.LayerName} CPU Compute", verbose_level=VerboseLevel.LAYER):
-                    input_data = self.get_cpu("input")
-                    output = self._cpu_forward(input_data)
-                    self.set_cpu("output", output)
-                
-                with NamedTimerInstance(f"  S{self.sid}: {self.LayerName} CPU->Enclave", verbose_level=VerboseLevel.LAYER):
-                    self.transfer_cpu_to_enclave("output")
+                with NamedTimerInstance(f"  S{self.sid}: {self.LayerName} gelu_forward", verbose_level=VerboseLevel.LAYER):
+                    self.gelu_forward(self.LayerName)
                     
             elif self.EnclaveMode == ExecutionModeOptions.CPU:
                 self.forward_tensor_transfer()
                 input_data = self.get_cpu("input")
-                if self.approximate:
-                    output = F.gelu(input_data, approximate='tanh')
-                else:
-                    output = F.gelu(input_data)
+                # Use our own implementation for CPU since PyTorch's approximate arg may not be available
+                output = self._cpu_forward(input_data)
                 self.set_cpu("output", output)
                 
             elif self.EnclaveMode == ExecutionModeOptions.GPU:
                 self.forward_tensor_transfer()
                 input_data = self.get_gpu("input")
-                if self.approximate:
-                    output = F.gelu(input_data, approximate='tanh')
-                else:
-                    output = F.gelu(input_data)
+                # Use our own implementation for GPU since PyTorch's approximate arg may not be available
+                output = self._cpu_forward(input_data)
                 self.set_gpu("output", output)
     
     def plain_forward(self, NeedBackward=False):
@@ -170,5 +167,6 @@ class SecretGELULayer(SecretActivationLayer):
             get_relative=False, show_values=False
         )
         print(f"S{self.sid}: {self.LayerName} Forward Error: {err}")
+
 
 

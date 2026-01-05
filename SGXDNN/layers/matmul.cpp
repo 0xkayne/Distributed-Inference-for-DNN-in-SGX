@@ -4,10 +4,13 @@
 
 #include "matmul.hpp"
 #include "chunk_manager.hpp"
+#include "layer_timing.hpp"
+#include "runtime_stats_api.hpp"
 
 #include <cmath>
 #include <algorithm>
 #include <cstring>
+#include <stdexcept>
 
 using namespace std;
 
@@ -96,7 +99,7 @@ void MatMulBuffer::matmul_single(
 
 void MatMulBuffer::forward() {
     auto& chunk_manager = TrustedChunkManager::getInstance();
-    
+
     // For batch matmul, we process each (batch, head) pair independently
     int num_batch_head = batch * num_heads;
     
@@ -110,6 +113,79 @@ void MatMulBuffer::forward() {
     ChunkGuard<DtypeForCpuOp> A_guard(StoreChunkPool::GetChunkPool(), A_chunk);
     ChunkGuard<DtypeForCpuOp> B_guard(StoreChunkPool::GetChunkPool(), B_chunk);
     ChunkGuard<DtypeForCpuOp> C_guard(StoreChunkPool::GetChunkPool(), C_chunk);
+
+    double get1_ms = 0.0;
+    double get2_ms = 0.0;
+    double compute_ms = 0.0;
+    double store_ms = 0.0;
+
+    // Helper: get number of elements in a given chunk index for a tensor
+    auto chunk_elems_for = [&](shared_ptr<SecretTen> ten, int chunk_idx) -> int {
+        int total = ten->GetNumElem();
+        int start = chunk_idx * STORE_CHUNK_ELEM;
+        int remain = total - start;
+        return (remain >= STORE_CHUNK_ELEM) ? STORE_CHUNK_ELEM : remain;
+    };
+
+    // Helper: read a contiguous slice [offset, offset+len) (in elements) from a SecretTen into dst.
+    // This guarantees each underlying chunk_id is always accessed with its canonical chunk byte size,
+    // avoiding the "same id different size" crash when STORE_CHUNK_ELEM is larger than per-head blocks.
+    auto read_slice = [&](shared_ptr<SecretTen> ten, int offset, int len, DtypeForCpuOp* dst, double& get_ms_acc) {
+        int copied = 0;
+        while (copied < len) {
+            int global_idx = offset + copied;
+            int chunk_idx = global_idx / STORE_CHUNK_ELEM;
+            int chunk_start = chunk_idx * STORE_CHUNK_ELEM;
+            int in_chunk_off = global_idx - chunk_start;
+            int can_copy = std::min(len - copied, STORE_CHUNK_ELEM - in_chunk_off);
+            int chunk_elems = chunk_elems_for(ten, chunk_idx);
+            int chunk_bytes = chunk_elems * (int)sizeof(DtypeForCpuOp);
+
+            // Decrypt full chunk (canonical size), then copy subrange
+            std::vector<DtypeForCpuOp> tmp(chunk_elems);
+            {
+                auto t0 = layer_now_us();
+                chunk_manager.GetChunk(ten->ChunkIds[chunk_idx], tmp.data(), chunk_bytes);
+                auto t1 = layer_now_us();
+                get_ms_acc += layer_elapsed_ms(t0, t1);
+            }
+            memcpy(dst + copied, tmp.data() + in_chunk_off, can_copy * sizeof(DtypeForCpuOp));
+            copied += can_copy;
+        }
+    };
+
+    // Helper: write a contiguous slice [offset, offset+len) (in elements) from src into a SecretTen.
+    // We preserve other data in the same chunk by read-modify-write on the canonical chunk size.
+    auto write_slice = [&](shared_ptr<SecretTen> ten, int offset, int len, const DtypeForCpuOp* src, double& store_ms_acc) {
+        int copied = 0;
+        while (copied < len) {
+            int global_idx = offset + copied;
+            int chunk_idx = global_idx / STORE_CHUNK_ELEM;
+            int chunk_start = chunk_idx * STORE_CHUNK_ELEM;
+            int in_chunk_off = global_idx - chunk_start;
+            int can_copy = std::min(len - copied, STORE_CHUNK_ELEM - in_chunk_off);
+            int chunk_elems = chunk_elems_for(ten, chunk_idx);
+            int chunk_bytes = chunk_elems * (int)sizeof(DtypeForCpuOp);
+
+            std::vector<DtypeForCpuOp> tmp(chunk_elems);
+            // Read existing chunk (canonical size) so we don't clobber unrelated regions.
+            {
+                auto t0 = layer_now_us();
+                chunk_manager.GetChunk(ten->ChunkIds[chunk_idx], tmp.data(), chunk_bytes);
+                auto t1 = layer_now_us();
+                // Treat output read as part of store path (we need RMW); include in store bucket.
+                store_ms_acc += layer_elapsed_ms(t0, t1);
+            }
+            memcpy(tmp.data() + in_chunk_off, src + copied, can_copy * sizeof(DtypeForCpuOp));
+            {
+                auto t0 = layer_now_us();
+                chunk_manager.StoreChunk(ten->ChunkIds[chunk_idx], tmp.data(), chunk_bytes);
+                auto t1 = layer_now_us();
+                store_ms_acc += layer_elapsed_ms(t0, t1);
+            }
+            copied += can_copy;
+        }
+    };
     
     // Process each (batch, head) pair
     for (int bh = 0; bh < num_batch_head; bh++) {
@@ -118,19 +194,25 @@ void MatMulBuffer::forward() {
         int C_offset = bh * size_C;
         
         // Load input matrices
-        int A_size_bytes = size_A * sizeof(DtypeForCpuOp);
-        int B_size_bytes = size_B * sizeof(DtypeForCpuOp);
-        int C_size_bytes = size_C * sizeof(DtypeForCpuOp);
-        
-        chunk_manager.GetChunk(input1_tensor->GetChunkId(A_offset), A_chunk, A_size_bytes);
-        chunk_manager.GetChunk(input2_tensor->GetChunkId(B_offset), B_chunk, B_size_bytes);
-        
+        // Load per-head matrices (robust to any STORE_CHUNK_ELEM)
+        read_slice(input1_tensor, A_offset, size_A, A_chunk, get1_ms);
+        read_slice(input2_tensor, B_offset, size_B, B_chunk, get2_ms);
+
         // Perform matrix multiplication
-        matmul_single(A_chunk, B_chunk, C_chunk, M, K, N, transpose_a, transpose_b);
+        {
+            auto t0 = layer_now_us();
+            matmul_single(A_chunk, B_chunk, C_chunk, M, K, N, transpose_a, transpose_b);
+            auto t1 = layer_now_us();
+            compute_ms += layer_elapsed_ms(t0, t1);
+        }
         
         // Store output matrix
-        chunk_manager.StoreChunk(output_tensor->GetChunkId(C_offset), C_chunk, C_size_bytes);
+        write_slice(output_tensor, C_offset, size_C, C_chunk, store_ms);
     }
+
+    // num_inputs=2, separate get timings for input1/input2 (get_ms + get2_ms)
+    SecretSetLayerRuntimeStats(FunId, get1_ms, compute_ms, store_ms, get2_ms, 0.0, 2);
 }
+
 
 

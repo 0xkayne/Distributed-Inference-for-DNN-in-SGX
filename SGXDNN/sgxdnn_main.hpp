@@ -65,6 +65,60 @@ extern "C" {
                 uint32_t output_h, uint32_t output_w, uint32_t output_c,
                 uint32_t kernel, uint32_t padding, uint32_t stride);
         void SecretSGXConvForward(uint64_t FunId);
+
+        // LayerNorm Layer
+        void SecretInitLayernorm(
+                uint64_t FunId,
+                uint64_t input, uint64_t output, uint64_t gamma, uint64_t beta,
+                uint32_t batch_, uint32_t seq_len_, uint32_t embed_dim_,
+                float epsilon_);
+        void SecretLayernormForward(uint64_t FunId);
+
+        // Softmax Layer
+        void SecretInitSoftmax(
+                uint64_t FunId,
+                uint64_t input, uint64_t output,
+                uint32_t total_elements_, uint32_t softmax_dim_);
+        void SecretSoftmaxForward(uint64_t FunId);
+
+        // GELU Activation Layer
+        void SecretInitGELU(
+                uint64_t FunId,
+                uint64_t input, uint64_t output,
+                uint32_t num_elements_, int use_approximate_);
+        void SecretGELUForward(uint64_t FunId);
+
+        // MatMul Layer
+        void SecretInitMatMul(
+                uint64_t FunId,
+                uint64_t input1, uint64_t input2, uint64_t output,
+                uint32_t batch_, uint32_t num_heads_, uint32_t seq_len_,
+                uint32_t dim1_, uint32_t dim2_,
+                int transpose_a_, int transpose_b_,
+                float scale_);
+        void SecretMatMulForward(uint64_t FunId);
+
+        // ------------------------------------------------------------
+        // Per-layer runtime stats (timing breakdown) for profiling
+        // ------------------------------------------------------------
+        // Times are in milliseconds.
+        void SecretSetLayerRuntimeStats(
+                uint64_t FunId,
+                double get_ms,
+                double compute_ms,
+                double store_ms,
+                double get2_ms,
+                double store2_ms,
+                int32_t num_inputs);
+
+        void SecretGetLayerRuntimeStats(
+                uint64_t FunId,
+                double* get_ms,
+                double* compute_ms,
+                double* store_ms,
+                double* get2_ms,
+                double* store2_ms,
+                int32_t* num_inputs);
 }
 
 #define REPS 2

@@ -101,9 +101,28 @@ class SecretLayerNormLayer(SecretActivationLayer):
                 self.get_cpu("bias").data.copy_(self.PlainFunc.bias.data)
                 self.transfer_cpu_to_enclave("weight")
                 self.transfer_cpu_to_enclave("bias")
-                
-                # TODO: Initialize native enclave LayerNorm when implemented
-                # self.layernorm_init(...)
+            
+            # Calculate batch and seq_len from InputShape
+            # InputShape is typically [batch, seq_len, embed_dim] or [batch * seq_len, embed_dim]
+            if len(self.InputShape) == 3:
+                batch_size = self.InputShape[0]
+                seq_len = self.InputShape[1]
+                embed_dim = self.InputShape[2]
+            elif len(self.InputShape) == 2:
+                # Flattened [batch * seq_len, embed_dim]
+                batch_size = 1
+                seq_len = self.InputShape[0]
+                embed_dim = self.InputShape[1]
+            else:
+                raise ValueError(f"Unsupported InputShape for LayerNorm: {self.InputShape}")
+            
+            # Initialize native enclave LayerNorm
+            self.layernorm_init(
+                self.LayerName,
+                "input", "output", "weight", "bias",
+                batch_size, seq_len, embed_dim,
+                self.eps
+            )
         else:
             # CPU or GPU mode
             self.ForwardFuncModule = nn.LayerNorm(
@@ -150,35 +169,11 @@ class SecretLayerNormLayer(SecretActivationLayer):
         """Forward pass."""
         with NamedTimerInstance(f"S{self.sid}: {self.LayerName} Forward", verbose_level=VerboseLevel.LAYER):
             if self.EnclaveMode == ExecutionModeOptions.Enclave:
-                # For Enclave mode: transfer to CPU, compute, transfer back
-                with NamedTimerInstance(f"  S{self.sid}: {self.LayerName} Enclave->CPU", verbose_level=VerboseLevel.LAYER):
+                # Native Enclave execution
+                with NamedTimerInstance(f"  S{self.sid}: {self.LayerName} Input Preprocess", verbose_level=VerboseLevel.LAYER):
                     self.forward_tensor_transfer()
-                    self.transfer_enclave_to_cpu("input")
-                    if self.elementwise_affine:
-                        self.transfer_enclave_to_cpu("weight")
-                        self.transfer_enclave_to_cpu("bias")
-                
-                with NamedTimerInstance(f"  S{self.sid}: {self.LayerName} CPU Compute", verbose_level=VerboseLevel.LAYER):
-                    input_data = self.get_cpu("input")
-                    
-                    # Use PyTorch LayerNorm with current weights
-                    if self.elementwise_affine:
-                        weight = self.get_cpu("weight")
-                        bias = self.get_cpu("bias")
-                        # Compute manually to use current weights
-                        mean = input_data.mean(dim=-1, keepdim=True)
-                        var = input_data.var(dim=-1, unbiased=False, keepdim=True)
-                        normalized = (input_data - mean) / torch.sqrt(var + self.eps)
-                        output = normalized * weight + bias
-                    else:
-                        mean = input_data.mean(dim=-1, keepdim=True)
-                        var = input_data.var(dim=-1, unbiased=False, keepdim=True)
-                        output = (input_data - mean) / torch.sqrt(var + self.eps)
-                    
-                    self.set_cpu("output", output)
-                
-                with NamedTimerInstance(f"  S{self.sid}: {self.LayerName} CPU->Enclave", verbose_level=VerboseLevel.LAYER):
-                    self.transfer_cpu_to_enclave("output")
+                with NamedTimerInstance(f"  S{self.sid}: {self.LayerName} layernorm_forward", verbose_level=VerboseLevel.LAYER):
+                    self.layernorm_forward(self.LayerName)
                     
             elif self.EnclaveMode == ExecutionModeOptions.CPU:
                 self.forward_tensor_transfer()
@@ -225,5 +220,6 @@ class SecretLayerNormLayer(SecretActivationLayer):
             get_relative=False, show_values=False
         )
         print(f"S{self.sid}: {self.LayerName} Forward Error: {err}")
+
 
 

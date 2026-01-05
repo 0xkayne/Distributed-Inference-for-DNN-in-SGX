@@ -22,6 +22,11 @@
 #include "layers/linear.hpp"
 #include "layers/conv.hpp"
 #include "layers/maxpool.hpp"
+#include "layers/layernorm.hpp"
+#include "layers/softmax.hpp"
+#include "layers/gelu.hpp"
+#include "layers/matmul.hpp"
+#include "layers/runtime_stats_api.hpp"
 
 #include "common_with_enclaves.h"
 
@@ -447,6 +452,153 @@ void SecretSgdUpdate(IdT paramId, IdT gradId, IdT momentumId,
 
 void SecretStochasticQuantize(IdT src_id, IdT dst_id, uint64_t q_tag) {
     quantize_stochastic(GetTenById(src_id), GetTenById(dst_id), q_tag);
+}
+
+// ============================================================================
+// LayerNorm Layer
+// ============================================================================
+unordered_map<IdT, shared_ptr<LayernormBuffer>> LayernormHolder;
+shared_ptr<LayernormBuffer> GetLayernormBufferById(IdT FunId) {
+    return LayernormHolder[FunId];
+}
+
+void SecretInitLayernorm(
+        IdT FunId,
+        IdT input, IdT output, IdT gamma, IdT beta,
+        uint32_t batch_, uint32_t seq_len_, uint32_t embed_dim_,
+        float epsilon_) {
+
+    auto ln_buffer = make_shared<LayernormBuffer>(FunId);
+    LayernormHolder[FunId] = ln_buffer;
+    ln_buffer->init(input, output, gamma, beta, batch_, seq_len_, embed_dim_, epsilon_);
+}
+
+void SecretLayernormForward(IdT FunId) {
+    GetLayernormBufferById(FunId)->forward();
+}
+
+// ============================================================================
+// Softmax Layer
+// ============================================================================
+unordered_map<IdT, shared_ptr<SoftmaxBuffer>> SoftmaxHolder;
+shared_ptr<SoftmaxBuffer> GetSoftmaxBufferById(IdT FunId) {
+    return SoftmaxHolder[FunId];
+}
+
+void SecretInitSoftmax(
+        IdT FunId,
+        IdT input, IdT output,
+        uint32_t total_elements_, uint32_t softmax_dim_) {
+
+    auto sm_buffer = make_shared<SoftmaxBuffer>(FunId);
+    SoftmaxHolder[FunId] = sm_buffer;
+    sm_buffer->init(input, output, total_elements_, softmax_dim_);
+}
+
+void SecretSoftmaxForward(IdT FunId) {
+    GetSoftmaxBufferById(FunId)->forward();
+}
+
+// ============================================================================
+// GELU Activation Layer
+// ============================================================================
+unordered_map<IdT, shared_ptr<GELUBuffer>> GELUHolder;
+shared_ptr<GELUBuffer> GetGELUBufferById(IdT FunId) {
+    return GELUHolder[FunId];
+}
+
+void SecretInitGELU(
+        IdT FunId,
+        IdT input, IdT output,
+        uint32_t num_elements_, int use_approximate_) {
+
+    auto gelu_buffer = make_shared<GELUBuffer>(FunId);
+    GELUHolder[FunId] = gelu_buffer;
+    gelu_buffer->init(input, output, num_elements_, (bool)use_approximate_);
+}
+
+void SecretGELUForward(IdT FunId) {
+    GetGELUBufferById(FunId)->forward();
+}
+
+// ============================================================================
+// MatMul (Batch Matrix Multiplication) Layer
+// ============================================================================
+unordered_map<IdT, shared_ptr<MatMulBuffer>> MatMulHolder;
+shared_ptr<MatMulBuffer> GetMatMulBufferById(IdT FunId) {
+    return MatMulHolder[FunId];
+}
+
+void SecretInitMatMul(
+        IdT FunId,
+        IdT input1, IdT input2, IdT output,
+        uint32_t batch_, uint32_t num_heads_, uint32_t seq_len_,
+        uint32_t dim1_, uint32_t dim2_,
+        int transpose_a_, int transpose_b_,
+        float scale_) {
+
+    auto mm_buffer = make_shared<MatMulBuffer>(FunId);
+    MatMulHolder[FunId] = mm_buffer;
+    mm_buffer->init(input1, input2, output, batch_, num_heads_, seq_len_, 
+                    dim1_, dim2_, (bool)transpose_a_, (bool)transpose_b_, scale_);
+}
+
+void SecretMatMulForward(IdT FunId) {
+    GetMatMulBufferById(FunId)->forward();
+}
+
+// ============================================================================
+// Per-layer runtime stats (timing breakdown) for profiling
+// ============================================================================
+typedef struct LayerRuntimeStats {
+    double get_ms;
+    double compute_ms;
+    double store_ms;
+    double get2_ms;
+    double store2_ms;
+    int32_t num_inputs;
+} LayerRuntimeStats;
+
+static unordered_map<IdT, LayerRuntimeStats> LayerRuntimeStatsHolder;
+
+void SecretSetLayerRuntimeStats(
+        IdT FunId,
+        double get_ms,
+        double compute_ms,
+        double store_ms,
+        double get2_ms,
+        double store2_ms,
+        int32_t num_inputs) {
+    LayerRuntimeStatsHolder[FunId] = LayerRuntimeStats{
+        get_ms, compute_ms, store_ms, get2_ms, store2_ms, num_inputs
+    };
+}
+
+void SecretGetLayerRuntimeStats(
+        IdT FunId,
+        double* get_ms,
+        double* compute_ms,
+        double* store_ms,
+        double* get2_ms,
+        double* store2_ms,
+        int32_t* num_inputs) {
+    auto it = LayerRuntimeStatsHolder.find(FunId);
+    if (it == LayerRuntimeStatsHolder.end()) {
+        if (get_ms) *get_ms = 0.0;
+        if (compute_ms) *compute_ms = 0.0;
+        if (store_ms) *store_ms = 0.0;
+        if (get2_ms) *get2_ms = 0.0;
+        if (store2_ms) *store2_ms = 0.0;
+        if (num_inputs) *num_inputs = 0;
+        return;
+    }
+    const LayerRuntimeStats& s = it->second;
+    if (get_ms) *get_ms = s.get_ms;
+    if (compute_ms) *compute_ms = s.compute_ms;
+    if (store_ms) *store_ms = s.store_ms;
+    if (get2_ms) *get2_ms = s.get2_ms;
+    if (store2_ms) *store2_ms = s.store2_ms;
+    if (num_inputs) *num_inputs = s.num_inputs;
 }
 
 } // End of extern C

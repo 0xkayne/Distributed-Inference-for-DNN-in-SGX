@@ -43,6 +43,7 @@ from experiments.models.sgx_inception import SGXInceptionV3
 from python.enclave_interfaces import GlobalTensor
 from python.sgx_net import SecretNeuralNetwork
 from python.utils.basic_utils import ExecutionModeOptions
+from python.layers.concatenate import SecretConcatenateLayer
 
 
 # Default measurement parameters
@@ -88,6 +89,24 @@ class LayerMetrics:
     
     # Number of iterations used
     num_iterations: int = 0
+    
+    # ===== Memory Analysis Fields (TEE vs CPU) =====
+    # CPU Mode Memory (theoretical, in bytes)
+    cpu_memory_bytes: int = 0           # Total CPU memory: input + output + weight + bias
+    
+    # TEE Mode Memory (theoretical, in bytes)
+    tee_memory_bytes: int = 0           # Total TEE tensor memory (same as CPU tensor data)
+    tee_encryption_overhead: int = 0    # AES-GCM encryption metadata overhead
+    tee_total_memory_bytes: int = 0     # TEE total = tensor + encryption overhead
+    
+    # Memory breakdown (in bytes)
+    weight_bytes: int = 0               # Weight tensor size
+    bias_bytes: int = 0                 # Bias tensor size
+    activation_bytes: int = 0           # Input + Output tensor size
+    
+    # TEE-specific metadata
+    num_chunks: int = 0                 # Number of STORE_CHUNK for this layer
+    chunk_metadata_bytes: int = 0       # Per-chunk encryption metadata (IV + TAG)
 
     def compute_statistics(self):
         """Compute statistics from raw timing data."""
@@ -129,6 +148,16 @@ class LayerMetrics:
             'output_shape': self.output_shape,
             'dependencies': self.dependencies,
             'num_iterations': self.num_iterations,
+            # Memory analysis fields
+            'cpu_memory_bytes': self.cpu_memory_bytes,
+            'tee_memory_bytes': self.tee_memory_bytes,
+            'tee_encryption_overhead': self.tee_encryption_overhead,
+            'tee_total_memory_bytes': self.tee_total_memory_bytes,
+            'weight_bytes': self.weight_bytes,
+            'bias_bytes': self.bias_bytes,
+            'activation_bytes': self.activation_bytes,
+            'num_chunks': self.num_chunks,
+            'chunk_metadata_bytes': self.chunk_metadata_bytes,
         }
 
 
@@ -180,6 +209,370 @@ def _shape_to_bytes(shape: List[int]) -> int:
     if not shape:
         return 0
     return int(np.prod(shape)) * 4  # float32 = 4 bytes
+
+
+# =============================================================================
+# Memory Analysis Constants and Functions for TEE vs CPU Comparison
+# =============================================================================
+# SGX AES-GCM encryption metadata sizes (from Include/crypto_common.h)
+SGX_AESGCM_IV_SIZE = 12      # IV (Initialization Vector): 12 bytes
+SGX_AESGCM_MAC_SIZE = 16     # TAG (Message Authentication Code): 16 bytes
+SGX_AES_GCM_STRUCT_SIZE = 32  # Approximate size of sgx_aes_gcm_data_t struct
+
+# Per-chunk encryption overhead: IV + TAG + struct metadata
+CHUNK_ENCRYPTION_OVERHEAD = SGX_AESGCM_IV_SIZE + SGX_AESGCM_MAC_SIZE + SGX_AES_GCM_STRUCT_SIZE  # ~60 bytes
+
+# Default STORE_CHUNK_ELEM (from Include/common_with_enclaves.h)
+DEFAULT_STORE_CHUNK_ELEM = 4276896  # ~16.3MB per chunk in float32
+
+# Thread pool size affects ChunkPool pre-allocation
+THREAD_POOL_SIZE = 4
+
+# ChunkPool shared memory overhead (enclave-internal, amortized across layers)
+# Formula: THREAD_POOL_SIZE * 2 * STORE_CHUNK_ELEM * 4 bytes
+def _calc_chunkpool_overhead(store_chunk_elem: int = DEFAULT_STORE_CHUNK_ELEM) -> int:
+    """Calculate ChunkPool pre-allocated memory (shared across all layers)."""
+    return THREAD_POOL_SIZE * 2 * store_chunk_elem * 4  # ~30MB for default
+
+
+def _get_layer_weight_shape(layer) -> Tuple[List[int], List[int]]:
+    """
+    Extract weight and bias shapes from a layer based on its type.
+    
+    Priority for extracting shapes:
+    1. Direct shape attributes (pytorch_w_shape, WeightShape, bias_shape, BiasShape)
+    2. SGX-specific attributes (n_output_channel, n_input_channel, filter_hw)
+    3. Standard PyTorch attributes (out_channels, in_channels, etc.)
+    4. Infer from input/output shapes
+    
+    Returns:
+        Tuple of (weight_shape, bias_shape)
+    """
+    weight_shape = []
+    bias_shape = []
+    layer_type = type(layer).__name__
+    
+    # Priority 1: Direct shape attributes (most reliable for SGX layers)
+    # Check pytorch_w_shape first (SGXConvBase)
+    if hasattr(layer, 'pytorch_w_shape') and layer.pytorch_w_shape:
+        weight_shape = list(layer.pytorch_w_shape)
+    # Also check WeightShape (SGXLinearBase, BatchNorm)
+    elif hasattr(layer, 'WeightShape') and layer.WeightShape:
+        weight_shape = list(layer.WeightShape)
+    
+    # Check bias_shape first (SGXConvBase)
+    if hasattr(layer, 'bias_shape') and layer.bias_shape:
+        bias_shape = list(layer.bias_shape)
+    # Also check BiasShape (SGXLinearBase)
+    elif hasattr(layer, 'BiasShape') and layer.BiasShape:
+        bias_shape = list(layer.BiasShape)
+    
+    # If we got shapes from direct attributes, return early
+    if weight_shape:
+        # Ensure bias_shape is set if weight_shape exists
+        if not bias_shape and len(weight_shape) >= 1:
+            bias_shape = [weight_shape[0]]  # out_channels for conv, out_features for linear
+        return weight_shape, bias_shape
+    
+    # Priority 2: SGX-specific attributes (SGXConvBase, SGXLinearBase)
+    if 'Conv' in layer_type or 'SGXConv' in layer_type:
+        # SGXConvBase uses n_output_channel, n_input_channel, filter_hw
+        if hasattr(layer, 'n_output_channel') and hasattr(layer, 'n_input_channel'):
+            out_ch = layer.n_output_channel
+            in_ch = layer.n_input_channel
+            kh = getattr(layer, 'filter_hw', 3)
+            weight_shape = [out_ch, in_ch, kh, kh]
+            if not bias_shape:
+                bias_shape = [out_ch]
+        # Fallback: standard PyTorch attributes
+        elif hasattr(layer, 'out_channels') and hasattr(layer, 'in_channels'):
+            out_ch = layer.out_channels
+            in_ch = layer.in_channels
+            kh = getattr(layer, 'kernel_h', getattr(layer, 'kernel_size', 3))
+            kw = getattr(layer, 'kernel_w', getattr(layer, 'kernel_size', 3))
+            if isinstance(kh, tuple):
+                kh, kw = kh[0], kh[1] if len(kh) > 1 else kh[0]
+            weight_shape = [out_ch, in_ch, kh, kw]
+            bias_shape = [out_ch]
+    
+    elif 'Linear' in layer_type or 'SGXLinear' in layer_type:
+        # SGXLinearBase uses n_output_features, n_input_features
+        if hasattr(layer, 'n_output_features') and hasattr(layer, 'n_input_features'):
+            weight_shape = [layer.n_output_features, layer.n_input_features]
+            bias_shape = [layer.n_output_features]
+        # Fallback: standard PyTorch attributes
+        elif hasattr(layer, 'out_features') and hasattr(layer, 'in_features'):
+            weight_shape = [layer.out_features, layer.in_features]
+            bias_shape = [layer.out_features]
+    
+    elif 'BatchNorm' in layer_type or 'Batchnorm' in layer_type:
+        # BatchNorm: gamma, beta, running_mean, running_var
+        # SecretBatchNorm2dLayer uses NumChannel
+        if hasattr(layer, 'NumChannel') and layer.NumChannel:
+            num_features = layer.NumChannel
+            weight_shape = [num_features]  # gamma
+            bias_shape = [num_features]    # beta
+        elif hasattr(layer, 'num_features') and layer.num_features:
+            num_features = layer.num_features
+            weight_shape = [num_features]  # gamma
+            bias_shape = [num_features]    # beta
+        elif hasattr(layer, 'InputShape') and layer.InputShape:
+            # Infer from input shape: BatchNorm normalizes over channels (dim 1)
+            if len(layer.InputShape) >= 2:
+                num_features = layer.InputShape[1]  # [B, C, H, W] -> C
+                weight_shape = [num_features]
+                bias_shape = [num_features]
+    
+    return weight_shape, bias_shape
+
+
+def _calc_layer_memory(
+    layer,
+    input_shape: List[int],
+    output_shape: List[int],
+    store_chunk_elem: int = DEFAULT_STORE_CHUNK_ELEM
+) -> Dict[str, int]:
+    """
+    Calculate memory footprint for a single layer in both CPU and TEE modes.
+    
+    Memory Components:
+    - CPU Mode: input_tensor + output_tensor + weight + bias (all in float32)
+    - TEE Mode: Same tensor data + encryption metadata per chunk
+    
+    Args:
+        layer: The layer object (for extracting weight/bias shapes)
+        input_shape: Input tensor shape [B, C, H, W] or [B, Features]
+        output_shape: Output tensor shape
+        store_chunk_elem: STORE_CHUNK_ELEM value for chunk calculation
+    
+    Returns:
+        Dictionary with memory breakdown:
+        - cpu_memory_bytes: Total CPU memory
+        - tee_memory_bytes: TEE tensor memory (same as CPU)
+        - tee_encryption_overhead: Encryption metadata overhead
+        - tee_total_memory_bytes: Total TEE memory
+        - weight_bytes: Weight tensor size
+        - bias_bytes: Bias tensor size  
+        - activation_bytes: Input + Output tensor size
+        - num_chunks: Number of chunks for this layer
+        - chunk_metadata_bytes: Per-chunk encryption metadata
+    """
+    bytes_per_elem = 4  # float32
+    
+    # Calculate activation (input + output) memory
+    input_bytes = _shape_to_bytes(input_shape)
+    output_bytes = _shape_to_bytes(output_shape)
+    activation_bytes = input_bytes + output_bytes
+    
+    # Calculate weight and bias memory
+    weight_shape, bias_shape = _get_layer_weight_shape(layer)
+    weight_bytes = _shape_to_bytes(weight_shape)
+    bias_bytes = _shape_to_bytes(bias_shape)
+    
+    # For BatchNorm, also account for running_mean and running_var
+    layer_type = type(layer).__name__
+    if 'BatchNorm' in layer_type or 'Batchnorm' in layer_type:
+        # running_mean + running_var = 2 * num_features * 4 bytes
+        weight_bytes *= 2  # gamma + running_mean
+        bias_bytes *= 2    # beta + running_var
+    
+    # Total tensor memory (same for CPU and TEE tensor data)
+    cpu_memory_bytes = activation_bytes + weight_bytes + bias_bytes
+    tee_memory_bytes = cpu_memory_bytes  # Same tensor data
+    
+    # Calculate TEE encryption overhead
+    # Each chunk of data gets encrypted with IV + TAG metadata
+    total_elements = 0
+    if input_shape:
+        total_elements += int(np.prod(input_shape))
+    if output_shape:
+        total_elements += int(np.prod(output_shape))
+    if weight_shape:
+        total_elements += int(np.prod(weight_shape))
+    if bias_shape:
+        total_elements += int(np.prod(bias_shape))
+    
+    # Number of chunks = ceil(total_elements / store_chunk_elem)
+    num_chunks = max(1, int(np.ceil(total_elements / store_chunk_elem))) if total_elements > 0 else 0
+    
+    # Per-chunk metadata overhead
+    chunk_metadata_bytes = CHUNK_ENCRYPTION_OVERHEAD
+    tee_encryption_overhead = num_chunks * chunk_metadata_bytes
+    
+    # Total TEE memory
+    tee_total_memory_bytes = tee_memory_bytes + tee_encryption_overhead
+    
+    return {
+        'cpu_memory_bytes': cpu_memory_bytes,
+        'tee_memory_bytes': tee_memory_bytes,
+        'tee_encryption_overhead': tee_encryption_overhead,
+        'tee_total_memory_bytes': tee_total_memory_bytes,
+        'weight_bytes': weight_bytes,
+        'bias_bytes': bias_bytes,
+        'activation_bytes': activation_bytes,
+        'num_chunks': num_chunks,
+        'chunk_metadata_bytes': chunk_metadata_bytes,
+    }
+
+
+def _calc_layer_memory_from_shapes(
+    layer_type: str,
+    input_shape: List[int],
+    output_shape: List[int],
+    weight_shape: Optional[List[int]] = None,
+    bias_shape: Optional[List[int]] = None,
+    store_chunk_elem: int = DEFAULT_STORE_CHUNK_ELEM
+) -> Dict[str, int]:
+    """
+    Calculate memory footprint from shapes only (when layer object is not available).
+    
+    This is useful for loading from JSON/CSV where we only have shape information.
+    """
+    bytes_per_elem = 4  # float32
+    
+    # Calculate activation memory
+    input_bytes = _shape_to_bytes(input_shape)
+    output_bytes = _shape_to_bytes(output_shape)
+    activation_bytes = input_bytes + output_bytes
+    
+    # Calculate weight and bias memory
+    weight_bytes = _shape_to_bytes(weight_shape) if weight_shape else 0
+    bias_bytes = _shape_to_bytes(bias_shape) if bias_shape else 0
+    
+    # Estimate weight/bias from layer type if not provided
+    if weight_bytes == 0 and bias_bytes == 0:
+        weight_bytes, bias_bytes = _estimate_weight_bias_from_type(
+            layer_type, input_shape, output_shape
+        )
+    
+    # Total tensor memory
+    cpu_memory_bytes = activation_bytes + weight_bytes + bias_bytes
+    tee_memory_bytes = cpu_memory_bytes
+    
+    # Calculate chunks
+    total_elements = 0
+    for shape in [input_shape, output_shape]:
+        if shape:
+            total_elements += int(np.prod(shape))
+    if weight_shape:
+        total_elements += int(np.prod(weight_shape))
+    if bias_shape:
+        total_elements += int(np.prod(bias_shape))
+    
+    num_chunks = max(1, int(np.ceil(total_elements / store_chunk_elem))) if total_elements > 0 else 0
+    chunk_metadata_bytes = CHUNK_ENCRYPTION_OVERHEAD
+    tee_encryption_overhead = num_chunks * chunk_metadata_bytes
+    tee_total_memory_bytes = tee_memory_bytes + tee_encryption_overhead
+    
+    return {
+        'cpu_memory_bytes': cpu_memory_bytes,
+        'tee_memory_bytes': tee_memory_bytes,
+        'tee_encryption_overhead': tee_encryption_overhead,
+        'tee_total_memory_bytes': tee_total_memory_bytes,
+        'weight_bytes': weight_bytes,
+        'bias_bytes': bias_bytes,
+        'activation_bytes': activation_bytes,
+        'num_chunks': num_chunks,
+        'chunk_metadata_bytes': chunk_metadata_bytes,
+    }
+
+
+def _estimate_weight_bias_from_type(
+    layer_type: str,
+    input_shape: List[int],
+    output_shape: List[int]
+) -> Tuple[int, int]:
+    """
+    Estimate weight and bias sizes from layer type and shapes.
+    
+    This is a fallback when actual layer object is not available.
+    """
+    bytes_per_elem = 4
+    weight_bytes = 0
+    bias_bytes = 0
+    
+    if not input_shape or not output_shape:
+        return 0, 0
+    
+    # Conv layers
+    if 'Conv' in layer_type or 'SGXConv' in layer_type:
+        # Typical conv: [B, C_in, H, W] -> [B, C_out, H', W']
+        if len(input_shape) >= 2 and len(output_shape) >= 2:
+            in_channels = input_shape[1]
+            out_channels = output_shape[1]
+            # Assume 3x3 kernel as default
+            kernel_size = 3
+            weight_bytes = out_channels * in_channels * kernel_size * kernel_size * bytes_per_elem
+            bias_bytes = out_channels * bytes_per_elem
+    
+    # Linear layers
+    elif 'Linear' in layer_type or 'SGXLinear' in layer_type:
+        # Linear: [B, in_features] -> [B, out_features]
+        if len(input_shape) >= 2 and len(output_shape) >= 2:
+            in_features = input_shape[-1]
+            out_features = output_shape[-1]
+            weight_bytes = out_features * in_features * bytes_per_elem
+            bias_bytes = out_features * bytes_per_elem
+    
+    # BatchNorm layers
+    elif 'BatchNorm' in layer_type or 'Batchnorm' in layer_type:
+        # BatchNorm: normalizes over channels
+        if len(input_shape) >= 2:
+            num_features = input_shape[1]
+            # gamma + beta + running_mean + running_var
+            weight_bytes = num_features * 2 * bytes_per_elem
+            bias_bytes = num_features * 2 * bytes_per_elem
+    
+    return weight_bytes, bias_bytes
+
+
+def print_memory_summary(metrics_dict: Dict[str, 'LayerMetrics'], title: str = "Memory Summary"):
+    """
+    Print a summary of memory usage for all layers.
+    
+    Args:
+        metrics_dict: Dictionary of LayerMetrics
+        title: Title for the summary
+    """
+    print(f"\n{'='*80}")
+    print(f" {title}")
+    print(f"{'='*80}")
+    
+    total_cpu = 0
+    total_tee = 0
+    total_overhead = 0
+    total_chunks = 0
+    
+    print(f"\n{'Layer Name':<40} {'CPU Memory':>12} {'TEE Memory':>12} {'Overhead':>10} {'Chunks':>8}")
+    print("-" * 84)
+    
+    for name, m in metrics_dict.items():
+        cpu_mb = m.cpu_memory_bytes / (1024 * 1024)
+        tee_mb = m.tee_total_memory_bytes / (1024 * 1024)
+        overhead_kb = m.tee_encryption_overhead / 1024
+        
+        print(f"{name:<40} {cpu_mb:>10.2f}MB {tee_mb:>10.2f}MB {overhead_kb:>8.1f}KB {m.num_chunks:>8}")
+        
+        total_cpu += m.cpu_memory_bytes
+        total_tee += m.tee_total_memory_bytes
+        total_overhead += m.tee_encryption_overhead
+        total_chunks += m.num_chunks
+    
+    print("-" * 84)
+    print(f"{'TOTAL':<40} {total_cpu/(1024*1024):>10.2f}MB {total_tee/(1024*1024):>10.2f}MB "
+          f"{total_overhead/1024:>8.1f}KB {total_chunks:>8}")
+    
+    # TEE overhead summary
+    print(f"\n--- TEE Overhead Analysis ---")
+    print(f"Total Encryption Overhead: {total_overhead/1024:.2f} KB ({100*total_overhead/max(total_tee,1):.2f}% of TEE memory)")
+    print(f"Total Chunks: {total_chunks}")
+    print(f"Average Overhead per Chunk: {CHUNK_ENCRYPTION_OVERHEAD} bytes")
+    
+    # ChunkPool overhead (shared)
+    chunkpool_overhead = _calc_chunkpool_overhead()
+    print(f"\nChunkPool Shared Overhead: {chunkpool_overhead/(1024*1024):.2f} MB (amortized across all layers)")
+    print(f"Effective TEE Total (with ChunkPool): {(total_tee + chunkpool_overhead)/(1024*1024):.2f} MB")
+
 
 # =============================================================================
 # STORE_CHUNK_ELEM Calculation Notes for Inception V3
@@ -318,9 +711,9 @@ GROUP_CONFIGS = {
     # Constraints: 17*17=289 (pool), 192 (channels)
     'Inception-B1': {
         'store_chunk_elem': 55488,  # LCM(289, 192) = 55,488 (~0.21MB)
-        'input_shape': [1, 768, 17, 17],      # From Reduction-A
+        'input_shape': [1, 1024, 17, 17],     # From Reduction-A (384+384+256=1024 channels)
         'output_shape': [1, 768, 17, 17],
-        'description': 'Inception-B block 1 (17x17x768)',
+        'description': 'Inception-B block 1 (17x17x1024 -> 17x17x768)',
         'layer_prefixes': ['inception_b1_'],
         'layer_names_pattern': 'inception_b1_',
     },
@@ -945,12 +1338,19 @@ def run_single_group(group_name, batch_size=1, input_size=299, num_classes=1000,
         print(f"   ✓ Found {len(group_layers)} layers in {group_name}")
         print(f"   Layer indices: {first_group_layer_idx} to {last_group_layer_idx}")
         
-        # Initialize metrics
+        # Initialize metrics with memory analysis
         metrics: Dict[str, LayerMetrics] = OrderedDict()
+        group_store_chunk = config.get('store_chunk_elem', DEFAULT_STORE_CHUNK_ELEM)
+        
         for layer in group_layers:
             layer_input_shape = _get_layer_input_shape(layer)
             layer_output_shape = _get_layer_output_shape(layer)
             dependencies = _get_layer_dependencies(layer)
+            
+            # Calculate memory footprint for this layer
+            mem_info = _calc_layer_memory(
+                layer, layer_input_shape, layer_output_shape, group_store_chunk
+            )
             
             metrics[layer.LayerName] = LayerMetrics(
                 name=layer.LayerName,
@@ -962,6 +1362,16 @@ def run_single_group(group_name, batch_size=1, input_size=299, num_classes=1000,
                 output_bytes=_shape_to_bytes(layer_output_shape),
                 dependencies=dependencies,
                 num_iterations=num_iterations,
+                # Memory analysis fields
+                cpu_memory_bytes=mem_info['cpu_memory_bytes'],
+                tee_memory_bytes=mem_info['tee_memory_bytes'],
+                tee_encryption_overhead=mem_info['tee_encryption_overhead'],
+                tee_total_memory_bytes=mem_info['tee_total_memory_bytes'],
+                weight_bytes=mem_info['weight_bytes'],
+                bias_bytes=mem_info['bias_bytes'],
+                activation_bytes=mem_info['activation_bytes'],
+                num_chunks=mem_info['num_chunks'],
+                chunk_metadata_bytes=mem_info['chunk_metadata_bytes'],
             )
         
         # SKIP predecessor layers - directly inject simulated input to this group
@@ -975,13 +1385,53 @@ def run_single_group(group_name, batch_size=1, input_size=299, num_classes=1000,
             simulated_input = torch.randn(*simulated_input_shape)
             print(f"   Simulated input shape: {simulated_input_shape}")
             
-            # Initialize the first layer's input buffer with simulated data
-            first_layer = group_layers[0]
-            if hasattr(first_layer, 'set_cpu'):
-                first_layer.set_cpu("input", simulated_input)
-                if hasattr(first_layer, 'transfer_cpu_to_enclave'):
-                    first_layer.transfer_cpu_to_enclave("input")
-                print(f"   ✓ Injected simulated input to {first_layer.LayerName}")
+            # CRITICAL: Find ALL entry layers (branch heads) that need input injection
+            # Inception blocks have multiple parallel branches, each branch head connects
+            # to the same predecessor layer outside the group.
+            # We must inject input to ALL entry layers, not just the first one.
+            # EXCLUDE concat layers - they receive input from branch outputs, not from predecessor
+            entry_layers = []
+            for layer in group_layers:
+                # Skip concat layers - they have multiple inputs from branches
+                if isinstance(layer, SecretConcatenateLayer):
+                    continue
+                if layer.PrevLayer is not None and layer.PrevLayer not in group_layers:
+                    entry_layers.append(layer)
+            
+            print(f"   Found {len(entry_layers)} entry layers requiring input injection:")
+            for el in entry_layers:
+                print(f"      - {el.LayerName}")
+            
+            # Prepare tensor shape for InitTensor (must be 4D)
+            size = list(simulated_input_shape)
+            if len(size) < 4:
+                size = [1] * (4 - len(size)) + size
+            
+            eid = GlobalTensor.get_eid()
+            from python.enclave_interfaces import get_float_ptr
+            
+            # Inject input to ALL entry layers using raw SGX API
+            # This bypasses Python-level tag remapping which causes crashes
+            for entry_layer in entry_layers:
+                # 1. Get unremapped tag FIRST
+                input_tag = entry_layer.get_tag("input", remap=False)
+                
+                # 2. Remove tag link BEFORE set_cpu (CRITICAL: must be before set_cpu)
+                # Otherwise set_cpu uses remapped tag, but get_cpu uses unremapped tag -> KeyError
+                if input_tag in GlobalTensor.LinkedTags:
+                    del GlobalTensor.LinkedTags[input_tag]
+                
+                # 3. Now set_cpu will use the unremapped tag (since link is deleted)
+                entry_layer.set_cpu("input", simulated_input)
+                
+                # 4. Mark as initialized
+                GlobalTensor.IsInitEnclaveTensor[input_tag] = True
+                
+                # 5. Initialize and set tensor using raw C library functions
+                GlobalTensor.EnclaveInterface.lib.InitTensor(eid, input_tag, size[0], size[1], size[2], size[3])
+                GlobalTensor.EnclaveInterface.lib.SetTen(eid, input_tag, get_float_ptr(simulated_input))
+            
+            print(f"   ✓ Injected simulated input to {len(entry_layers)} entry layers (raw SGX API)")
         else:
             # For Stem-Part1, use original input
             model.layers[0].set_input(input_tensor)
@@ -1154,7 +1604,7 @@ def run_profile_grouped(batch_size=1, input_size=299, num_classes=1000,
     print("Updating STORE_CHUNK_ELEM to global value...")
     if not update_store_chunk_elem(GLOBAL_STORE_CHUNK_ELEM):
         print("✗ Failed to update STORE_CHUNK_ELEM. Exiting.")
-        return
+            return
     
     if not update_maxpool2d_store_chunk_elem(GLOBAL_STORE_CHUNK_ELEM):
         print("⚠ Warning: Failed to update STORE_CHUNK_ELEM in maxpool2d.py")
@@ -1170,9 +1620,9 @@ def run_profile_grouped(batch_size=1, input_size=299, num_classes=1000,
     else:
         # Rebuild with the new STORE_CHUNK_ELEM value
         print("\nRebuilding SGX code with global STORE_CHUNK_ELEM...")
-        if rebuild_sgx_code():
+            if rebuild_sgx_code():
             print("✓ Rebuild successful")
-        else:
+            else:
             print("\n⚠ Automatic rebuild failed. Please rebuild manually:")
             print(f"   cd {project_root} && rm -rf SGXDNN/bin_sgx && make clean && make SGX_MODE=HW all")
             user_input = input("Press Enter after rebuilding, or 'q' to quit: ").strip().lower()
@@ -1187,31 +1637,31 @@ def run_profile_grouped(batch_size=1, input_size=299, num_classes=1000,
     
     try:
         # Initialize GlobalTensor once
-        if not GlobalTensor.is_init_global_tensor:
+            if not GlobalTensor.is_init_global_tensor:
             print("Initializing GlobalTensor...")
-            GlobalTensor.init()
+                GlobalTensor.init()
         
         # Use _profile_all_groups to measure all layers with a single model instance
         all_enclave_metrics = _profile_all_groups(
-            batch_size, input_size, num_classes,
-            ExecutionModeOptions.Enclave,
+                batch_size, input_size, num_classes,
+                ExecutionModeOptions.Enclave,
             num_iterations=num_iterations,
             warmup_iterations=warmup_iterations
-        )
+            )
         print(f"\n✓ Enclave profiling completed: {len(all_enclave_metrics)} layers")
         
-    except Exception as e:
+        except Exception as e:
         print(f"\n✗ Error during Enclave profiling: {e}")
         import traceback
         traceback.print_exc()
         print("Continuing with CPU profiling...")
     finally:
         # Clean up GlobalTensor
-        if GlobalTensor.is_init_global_tensor:
-            try:
-                GlobalTensor.destroy()
-            except:
-                pass
+            if GlobalTensor.is_init_global_tensor:
+                try:
+                    GlobalTensor.destroy()
+                except:
+                    pass
     
     # Phase 2: Profile CPU mode (can use single pass as CPU doesn't have chunk constraints)
     print("\n" + "="*80)
@@ -1317,7 +1767,7 @@ def _profile_all_groups(batch_size, input_size, num_classes, mode,
     
     print(f"   Model created with {len(model.layers)} layers")
     
-    # Initialize metrics dictionary for ALL layers
+    # Initialize metrics dictionary for ALL layers with memory analysis
     metrics: Dict[str, LayerMetrics] = OrderedDict()
     
     for layer in model.layers:
@@ -1325,6 +1775,13 @@ def _profile_all_groups(batch_size, input_size, num_classes, mode,
         input_shape = _get_layer_input_shape(layer)
         output_shape = _get_layer_output_shape(layer)
         dependencies = _get_layer_dependencies(layer)
+        
+        # Get group-specific STORE_CHUNK_ELEM for memory calculation
+        group_config = GROUP_CONFIGS.get(layer_group, {})
+        group_store_chunk = group_config.get('store_chunk_elem', DEFAULT_STORE_CHUNK_ELEM)
+        
+        # Calculate memory footprint for this layer
+        mem_info = _calc_layer_memory(layer, input_shape, output_shape, group_store_chunk)
         
         metrics[layer.LayerName] = LayerMetrics(
             name=layer.LayerName,
@@ -1336,6 +1793,16 @@ def _profile_all_groups(batch_size, input_size, num_classes, mode,
             output_bytes=_shape_to_bytes(output_shape),
             dependencies=dependencies,
             num_iterations=num_iterations,
+            # Memory analysis fields
+            cpu_memory_bytes=mem_info['cpu_memory_bytes'],
+            tee_memory_bytes=mem_info['tee_memory_bytes'],
+            tee_encryption_overhead=mem_info['tee_encryption_overhead'],
+            tee_total_memory_bytes=mem_info['tee_total_memory_bytes'],
+            weight_bytes=mem_info['weight_bytes'],
+            bias_bytes=mem_info['bias_bytes'],
+            activation_bytes=mem_info['activation_bytes'],
+            num_chunks=mem_info['num_chunks'],
+            chunk_metadata_bytes=mem_info['chunk_metadata_bytes'],
         )
     
     # Warmup: execute full forward pass
@@ -1392,6 +1859,9 @@ def _profile_all_groups(batch_size, input_size, num_classes, mode,
     
     print(f"  {'TOTAL':20}: {total_time:8.2f} ms")
     print(f"{'='*60}")
+    
+    # Print memory summary
+    print_memory_summary(metrics, "Memory Analysis Summary")
     
     return metrics
 
@@ -1470,14 +1940,19 @@ def _profile_group(batch_size, input_size, num_classes, mode, group_name,
             for idx in range(group_layer_indices[0]):
                 model.layers[idx].forward()
         
-        # Initialize metrics dictionary
+        # Initialize metrics dictionary with memory analysis
         metrics: Dict[str, LayerMetrics] = OrderedDict()
+        group_config = GROUP_CONFIGS.get(group_name, {})
+        group_store_chunk = group_config.get('store_chunk_elem', DEFAULT_STORE_CHUNK_ELEM)
         
-        # Initialize LayerMetrics for each layer with shape and dependency info
+        # Initialize LayerMetrics for each layer with shape, dependency, and memory info
         for layer in group_layers:
             input_shape = _get_layer_input_shape(layer)
             output_shape = _get_layer_output_shape(layer)
             dependencies = _get_layer_dependencies(layer)
+            
+            # Calculate memory footprint for this layer
+            mem_info = _calc_layer_memory(layer, input_shape, output_shape, group_store_chunk)
             
             metrics[layer.LayerName] = LayerMetrics(
                 name=layer.LayerName,
@@ -1489,6 +1964,16 @@ def _profile_group(batch_size, input_size, num_classes, mode, group_name,
                 output_bytes=_shape_to_bytes(output_shape),
                 dependencies=dependencies,
                 num_iterations=num_iterations,
+                # Memory analysis fields
+                cpu_memory_bytes=mem_info['cpu_memory_bytes'],
+                tee_memory_bytes=mem_info['tee_memory_bytes'],
+                tee_encryption_overhead=mem_info['tee_encryption_overhead'],
+                tee_total_memory_bytes=mem_info['tee_total_memory_bytes'],
+                weight_bytes=mem_info['weight_bytes'],
+                bias_bytes=mem_info['bias_bytes'],
+                activation_bytes=mem_info['activation_bytes'],
+                num_chunks=mem_info['num_chunks'],
+                chunk_metadata_bytes=mem_info['chunk_metadata_bytes'],
             )
         
         # Warmup: execute this group multiple times
@@ -1516,13 +2001,13 @@ def _profile_group(batch_size, input_size, num_classes, mode, group_name,
             # Measure each layer
             for layer in group_layers:
                 start = time.perf_counter()  # Use perf_counter for higher precision
-                layer.forward()
+            layer.forward()
                 end = time.perf_counter()
-                duration_ms = (end - start) * 1000
-                
+            duration_ms = (end - start) * 1000
+            
                 if mode == ExecutionModeOptions.Enclave:
                     metrics[layer.LayerName].enclave_times.append(duration_ms)
-                else:
+            else:
                     metrics[layer.LayerName].cpu_times.append(duration_ms)
         
         # Compute statistics for all layers
@@ -1741,9 +2226,18 @@ def _profile_cpu_pytorch(batch_size, input_size, num_classes,
         else:
             pytorch_layers[name] = None  # Placeholder for concat, input, output
     
-    # Initialize metrics
+    # Initialize metrics with memory analysis
     for name, layer_type, group, output_shape in layer_info:
         input_shape = output_shape  # Simplified
+        
+        # Calculate memory using shape-based estimation
+        group_config = GROUP_CONFIGS.get(group, {})
+        group_store_chunk = group_config.get('store_chunk_elem', DEFAULT_STORE_CHUNK_ELEM)
+        mem_info = _calc_layer_memory_from_shapes(
+            layer_type, input_shape, output_shape, 
+            store_chunk_elem=group_store_chunk
+        )
+        
         metrics[name] = LayerMetrics(
             name=name,
             layer_type=layer_type,
@@ -1754,6 +2248,16 @@ def _profile_cpu_pytorch(batch_size, input_size, num_classes,
             output_bytes=_shape_to_bytes(output_shape),
             dependencies=[],  # Simplified
             num_iterations=num_iterations,
+            # Memory analysis fields
+            cpu_memory_bytes=mem_info['cpu_memory_bytes'],
+            tee_memory_bytes=mem_info['tee_memory_bytes'],
+            tee_encryption_overhead=mem_info['tee_encryption_overhead'],
+            tee_total_memory_bytes=mem_info['tee_total_memory_bytes'],
+            weight_bytes=mem_info['weight_bytes'],
+            bias_bytes=mem_info['bias_bytes'],
+            activation_bytes=mem_info['activation_bytes'],
+            num_chunks=mem_info['num_chunks'],
+            chunk_metadata_bytes=mem_info['chunk_metadata_bytes'],
         )
     
     # If using torchvision model, profile the whole model
@@ -1899,15 +2403,22 @@ def _profile_pass(batch_size, input_size, num_classes, mode,
         
         model.layers[0].set_input(input_tensor)
         
-        # Initialize metrics dictionary
+        # Initialize metrics dictionary with memory analysis
         metrics: Dict[str, LayerMetrics] = OrderedDict()
         
-        # Initialize LayerMetrics for each layer with shape and dependency info
+        # Initialize LayerMetrics for each layer with shape, dependency, and memory info
         for layer in model.layers:
             layer_group = get_layer_group(layer.LayerName) or "Unknown"
             input_shape = _get_layer_input_shape(layer)
             output_shape = _get_layer_output_shape(layer)
             dependencies = _get_layer_dependencies(layer)
+            
+            # Get group-specific STORE_CHUNK_ELEM for memory calculation
+            group_config = GROUP_CONFIGS.get(layer_group, {})
+            group_store_chunk = group_config.get('store_chunk_elem', DEFAULT_STORE_CHUNK_ELEM)
+            
+            # Calculate memory footprint for this layer
+            mem_info = _calc_layer_memory(layer, input_shape, output_shape, group_store_chunk)
             
             metrics[layer.LayerName] = LayerMetrics(
                 name=layer.LayerName,
@@ -1919,6 +2430,16 @@ def _profile_pass(batch_size, input_size, num_classes, mode,
                 output_bytes=_shape_to_bytes(output_shape),
                 dependencies=dependencies,
                 num_iterations=num_iterations,
+                # Memory analysis fields
+                cpu_memory_bytes=mem_info['cpu_memory_bytes'],
+                tee_memory_bytes=mem_info['tee_memory_bytes'],
+                tee_encryption_overhead=mem_info['tee_encryption_overhead'],
+                tee_total_memory_bytes=mem_info['tee_total_memory_bytes'],
+                weight_bytes=mem_info['weight_bytes'],
+                bias_bytes=mem_info['bias_bytes'],
+                activation_bytes=mem_info['activation_bytes'],
+                num_chunks=mem_info['num_chunks'],
+                chunk_metadata_bytes=mem_info['chunk_metadata_bytes'],
             )
         
         # Warmup
@@ -1926,22 +2447,22 @@ def _profile_pass(batch_size, input_size, num_classes, mode,
         for _ in range(warmup_iterations):
             for layer in model.layers:
                 layer.forward()
-        
+                
         # Measurement with multiple iterations
         print(f"Measuring layers ({mode.name}, {num_iterations} iterations)...")
         for iteration in range(num_iterations):
             if (iteration + 1) % 10 == 0:
                 print(f"   Iteration {iteration + 1}/{num_iterations}")
             
-            for layer in model.layers:
+        for layer in model.layers:
                 start = time.perf_counter()
-                layer.forward()
+            layer.forward()
                 end = time.perf_counter()
-                duration_ms = (end - start) * 1000
-                
+            duration_ms = (end - start) * 1000
+            
                 if mode == ExecutionModeOptions.Enclave:
                     metrics[layer.LayerName].enclave_times.append(duration_ms)
-                else:
+            else:
                     metrics[layer.LayerName].cpu_times.append(duration_ms)
         
         # Compute statistics for all layers
@@ -1972,7 +2493,11 @@ def _export_csv(enclave_data: Dict[str, LayerMetrics],
         "EnclaveTime_max", "EnclaveTime_p95", "EnclaveTime_p99",
         "CPUTime_mean", "CPUTime_std", "CPUTime_min", "CPUTime_max",
         "InputBytes", "OutputBytes", "InputShape", "OutputShape",
-        "Dependencies", "NumIterations"
+        "Dependencies", "NumIterations",
+        # Memory analysis columns
+        "CPU_Memory_Bytes", "TEE_Memory_Bytes", "TEE_Encryption_Overhead",
+        "TEE_Total_Memory_Bytes", "Weight_Bytes", "Bias_Bytes",
+        "Activation_Bytes", "Num_Chunks", "Chunk_Metadata_Bytes"
     ]
     
     # Ensure output directory exists
@@ -2015,6 +2540,16 @@ def _export_csv(enclave_data: Dict[str, LayerMetrics],
                 str(primary.output_shape) if primary else "[]",
                 ";".join(primary.dependencies) if primary else "",
                 primary.num_iterations if primary else 0,
+                # Memory analysis fields
+                primary.cpu_memory_bytes if primary else 0,
+                primary.tee_memory_bytes if primary else 0,
+                primary.tee_encryption_overhead if primary else 0,
+                primary.tee_total_memory_bytes if primary else 0,
+                primary.weight_bytes if primary else 0,
+                primary.bias_bytes if primary else 0,
+                primary.activation_bytes if primary else 0,
+                primary.num_chunks if primary else 0,
+                primary.chunk_metadata_bytes if primary else 0,
             ]
             writer.writerow(row)
     
@@ -2076,6 +2611,28 @@ def _export_json(enclave_data: Dict[str, LayerMetrics],
             "output_shape": primary.output_shape if primary else [],
             "dependencies": primary.dependencies if primary else [],
             "num_iterations": primary.num_iterations if primary else 0,
+            # Memory analysis fields
+            "memory": {
+                "cpu_bytes": primary.cpu_memory_bytes if primary else 0,
+                "tee_bytes": primary.tee_memory_bytes if primary else 0,
+                "tee_encryption_overhead": primary.tee_encryption_overhead if primary else 0,
+                "tee_total_bytes": primary.tee_total_memory_bytes if primary else 0,
+                "weight_bytes": primary.weight_bytes if primary else 0,
+                "bias_bytes": primary.bias_bytes if primary else 0,
+                "activation_bytes": primary.activation_bytes if primary else 0,
+                "num_chunks": primary.num_chunks if primary else 0,
+                "chunk_metadata_bytes": primary.chunk_metadata_bytes if primary else 0,
+            },
+            # Also include flat memory fields for backward compatibility with merge
+            "cpu_memory_bytes": primary.cpu_memory_bytes if primary else 0,
+            "tee_memory_bytes": primary.tee_memory_bytes if primary else 0,
+            "tee_encryption_overhead": primary.tee_encryption_overhead if primary else 0,
+            "tee_total_memory_bytes": primary.tee_total_memory_bytes if primary else 0,
+            "weight_bytes": primary.weight_bytes if primary else 0,
+            "bias_bytes": primary.bias_bytes if primary else 0,
+            "activation_bytes": primary.activation_bytes if primary else 0,
+            "num_chunks": primary.num_chunks if primary else 0,
+            "chunk_metadata_bytes": primary.chunk_metadata_bytes if primary else 0,
         }
         output["layers"].append(layer_data)
     
@@ -2215,6 +2772,16 @@ Recommended workflow for TEE profiling:
                             output_shape=layer_data.get('output_shape', []),
                             dependencies=layer_data.get('dependencies', []),
                             num_iterations=layer_data.get('num_iterations', 0),
+                            # Memory analysis fields
+                            cpu_memory_bytes=layer_data.get('cpu_memory_bytes', 0),
+                            tee_memory_bytes=layer_data.get('tee_memory_bytes', 0),
+                            tee_encryption_overhead=layer_data.get('tee_encryption_overhead', 0),
+                            tee_total_memory_bytes=layer_data.get('tee_total_memory_bytes', 0),
+                            weight_bytes=layer_data.get('weight_bytes', 0),
+                            bias_bytes=layer_data.get('bias_bytes', 0),
+                            activation_bytes=layer_data.get('activation_bytes', 0),
+                            num_chunks=layer_data.get('num_chunks', 0),
+                            chunk_metadata_bytes=layer_data.get('chunk_metadata_bytes', 0),
                         )
                         
                         # Also track CPU metrics if available
@@ -2227,6 +2794,16 @@ Recommended workflow for TEE profiling:
                                 cpu_time_std=cpu_data.get('std_ms', 0),
                                 cpu_time_min=cpu_data.get('min_ms', 0),
                                 cpu_time_max=cpu_data.get('max_ms', 0),
+                                # Memory fields for CPU metrics
+                                cpu_memory_bytes=layer_data.get('cpu_memory_bytes', 0),
+                                tee_memory_bytes=layer_data.get('tee_memory_bytes', 0),
+                                tee_encryption_overhead=layer_data.get('tee_encryption_overhead', 0),
+                                tee_total_memory_bytes=layer_data.get('tee_total_memory_bytes', 0),
+                                weight_bytes=layer_data.get('weight_bytes', 0),
+                                bias_bytes=layer_data.get('bias_bytes', 0),
+                                activation_bytes=layer_data.get('activation_bytes', 0),
+                                num_chunks=layer_data.get('num_chunks', 0),
+                                chunk_metadata_bytes=layer_data.get('chunk_metadata_bytes', 0),
                             )
             else:
                 missing_groups.append(group_name)
@@ -2390,13 +2967,13 @@ Recommended workflow for TEE profiling:
         print(f"   - {csv_path}")
         print(f"   - {json_path}")
     else:
-        run_profile(
-            batch_size=args.batch_size,
-            input_size=args.input_size,
-            num_classes=args.num_classes,
+    run_profile(
+        batch_size=args.batch_size,
+        input_size=args.input_size,
+        num_classes=args.num_classes,
             use_grouped=use_grouped,
             num_iterations=args.iterations,
             warmup_iterations=args.warmup,
             output_dir=args.output_dir
-        )
+    )
 

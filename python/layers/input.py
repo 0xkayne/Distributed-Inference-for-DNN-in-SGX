@@ -20,10 +20,30 @@ class SecretInputLayer(SecretNonlinearLayer):
     def init_shape(self):
         return
 
+    def generate_tensor_name_list(self, force=False):
+        """Generate tensor list for InputLayer - input and output (linked)."""
+        if not force and self.tensor_name_list:
+            return
+        
+        # InputLayer needs input and output tensors (they will be linked)
+        # Note: shape is set at __init__ time, not from PrevLayer
+        NeededTensorNames = [
+            ("input", self.shape, None),
+            ("output", self.shape, None),
+        ]
+        self.tensor_name_list = NeededTensorNames
+
     def set_input(self, tensor):
         self.set_cpu("input", tensor)
         if self.EnclaveMode is ExecutionModeOptions.Enclave:
+            # For InputLayer, input and output are linked (share same enclave storage)
+            # But we must ensure BOTH tags are initialized before any SetTen/GetTen
             self.set_tensor("input", tensor)
+            # Explicitly init output tag if not already done (link alone doesn't init)
+            output_tag = self.get_tag("output", remap=True)
+            from python.enclave_interfaces import GlobalTensor
+            if output_tag not in GlobalTensor.IsInitEnclaveTensor:
+                GlobalTensor.init_enclave_tensor(output_tag, list(tensor.shape))
         if self.EnclaveMode is ExecutionModeOptions.GPU:
             self.set_gpu("input", tensor)
 

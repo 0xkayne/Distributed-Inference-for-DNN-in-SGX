@@ -60,3 +60,4 @@ public:
 #endif // SOFTMAX_H
 
 
+

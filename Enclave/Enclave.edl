@@ -83,6 +83,50 @@ enclave {
                 uint32_t output_h, uint32_t output_w, uint32_t output_c,
                 uint32_t kernel, uint32_t padding, uint32_t stride);
         public void ecall_sgx_conv_forward(uint64_t FunId);
+
+        // LayerNorm Layer
+        public void ecall_init_layernorm(
+                uint64_t FunId,
+                uint64_t input, uint64_t output, uint64_t gamma, uint64_t beta,
+                uint32_t batch_, uint32_t seq_len_, uint32_t embed_dim_,
+                float epsilon_);
+        public void ecall_layernorm_forward(uint64_t FunId);
+
+        // Softmax Layer
+        public void ecall_init_softmax(
+                uint64_t FunId,
+                uint64_t input, uint64_t output,
+                uint32_t total_elements_, uint32_t softmax_dim_);
+        public void ecall_softmax_forward(uint64_t FunId);
+
+        // GELU Activation Layer
+        public void ecall_init_gelu(
+                uint64_t FunId,
+                uint64_t input, uint64_t output,
+                uint32_t num_elements_, int use_approximate_);
+        public void ecall_gelu_forward(uint64_t FunId);
+
+        // MatMul Layer
+        public void ecall_init_matmul(
+                uint64_t FunId,
+                uint64_t input1, uint64_t input2, uint64_t output,
+                uint32_t batch_, uint32_t num_heads_, uint32_t seq_len_,
+                uint32_t dim1_, uint32_t dim2_,
+                int transpose_a_, int transpose_b_,
+                float scale_);
+        public void ecall_matmul_forward(uint64_t FunId);
+
+        // Layer runtime stats (profiling)
+        // Times are in milliseconds.
+        public void ecall_get_layer_runtime_stats(
+            uint64_t FunId,
+            [out] double* get_ms,
+            [out] double* compute_ms,
+            [out] double* store_ms,
+            [out] double* get2_ms,
+            [out] double* store2_ms,
+            [out] int32_t* num_inputs
+        );
     };
 
     /*

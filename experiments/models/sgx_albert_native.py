@@ -1,33 +1,39 @@
 """
-SGX Vision Transformer (ViT) Model - Native Implementation.
+SGX ALBERT Model - Native Implementation.
 
-ViT-Base Architecture:
-- Patch Embedding: Conv2d (16x16 kernel, stride 16) 
-- CLS Token + Position Embedding
-- 12 Transformer Blocks, each containing:
-  - LayerNorm -> Multi-Head Self-Attention -> Residual
-  - LayerNorm -> FFN (MLP) -> Residual
-- Classification Head: LayerNorm -> Linear
+ALBERT Architecture (from ICLR 2020):
+- Factorized Embedding: Token/Position/Segment embeddings in E-dim, project to H-dim
+- Cross-layer Parameter Sharing: Single Transformer layer reused N times
+- Each shared block: MHSA -> Residual -> LayerNorm -> FFN -> Residual -> LayerNorm
 
-Reference: "An Image is Worth 16x16 Words" (Dosovitskiy et al., ICLR 2021)
+ALBERT Variants:
+1. ALBERT-base: 12 layers, H=768, E=128, 12 heads (~12M unique params)
+2. ALBERT-large: 24 layers, H=1024, E=128, 16 heads (~18M unique params)
 
-This implementation provides layer-by-layer execution for profiling and
-supports flexible CPU/Enclave partitioning for TEE optimization.
+Key Benefits for TEE:
+- Parameter sharing dramatically reduces memory footprint
+- Only need to load ONE set of layer parameters into EPC
+
+Reference: "ALBERT: A Lite BERT for Self-supervised Learning of Language
+            Representations" (Lan et al., ICLR 2020)
+GitHub: https://github.com/google-research/albert
+
+This implementation provides layer-by-layer execution for profiling.
+Note: For profiling, we measure each layer invocation separately even though
+parameters are shared.
 """
 
 import sys
 import math
 sys.path.insert(0, '.')
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
-from python.layers.sgx_conv_base import SGXConvBase
 from python.layers.sgx_linear_base import SGXLinearBase
 from python.layers.layer_norm import SecretLayerNormLayer
 from python.layers.gelu import SecretGELULayer
 from python.layers.softmax import SecretSoftmaxLayer
 from python.layers.matmul import SecretMatMulLayer
-from python.layers.scale import SecretScaleLayer
 from python.layers.reshape import SecretReshapeLayer
 from python.layers.add import SecretAddLayer
 from python.layers.input import SecretInputLayer
@@ -37,15 +43,12 @@ from python.utils.basic_utils import ExecutionModeOptions
 
 class MultiHeadSelfAttention:
     """
-    Multi-Head Self-Attention module.
+    Multi-Head Self-Attention module for ALBERT.
     
-    Structure:
-    - Input: (B, N, embed_dim) where N = num_patches + 1 (CLS token)
-    - QKV projection: Linear(embed_dim, 3*embed_dim) -> reshape to 3 tensors
+    Same structure as BERT attention:
+    - Q, K, V projections: Linear(hidden_dim, hidden_dim) each
     - Attention: Q @ K^T / sqrt(d_k) -> Softmax -> @ V
-    - Output projection: Linear(embed_dim, embed_dim)
-    
-    For SGX, we decompose this into individual operations for profiling.
+    - Output projection: Linear(hidden_dim, hidden_dim)
     """
     
     def __init__(
@@ -53,16 +56,16 @@ class MultiHeadSelfAttention:
         sid: int,
         name_prefix: str,
         enclave_mode: ExecutionModeOptions,
-        embed_dim: int,
+        hidden_dim: int,
         num_heads: int,
         batch_size: int = 1,
-        seq_len: int = 197,  # 196 patches + 1 CLS token
+        seq_len: int = 128,
         layer_mode_overrides: Optional[Dict[str, ExecutionModeOptions]] = None,
     ):
         self.layers = []
-        self.embed_dim = embed_dim
+        self.hidden_dim = hidden_dim
         self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
+        self.head_dim = hidden_dim // num_heads
         self.batch_size = batch_size
         self.seq_len = seq_len
         overrides = layer_mode_overrides or {}
@@ -70,44 +73,42 @@ class MultiHeadSelfAttention:
         def get_mode(name):
             return overrides.get(name, enclave_mode)
         
-        # NOTE:
-        # SGXLinearBase is 2D: (batch_size, in_features) -> (batch_size, out_features).
-        # For ViT tokens, we represent the sequence as a flattened 2D matrix:
-        #   tokens = batch_size * seq_len
-        #   shape  = (tokens, embed_dim)
-        #
-        # We use separate Q/K/V projections (instead of a fused QKV) to keep
-        # reshape semantics valid without introducing a slice op here.
+        # Flatten tokens for Linear layers
         self.tokens = batch_size * seq_len
+        
+        # Q projection
         self.q_proj = SGXLinearBase(
             sid, f"{name_prefix}_q_proj", get_mode(f"{name_prefix}_q_proj"),
             batch_size=self.tokens,
-            n_output_features=embed_dim,
-            n_input_features=embed_dim,
+            n_output_features=hidden_dim,
+            n_input_features=hidden_dim,
             manually_register_prev=True, manually_register_next=True
         )
+        
+        # K projection
         self.k_proj = SGXLinearBase(
             sid, f"{name_prefix}_k_proj", get_mode(f"{name_prefix}_k_proj"),
             batch_size=self.tokens,
-            n_output_features=embed_dim,
-            n_input_features=embed_dim,
+            n_output_features=hidden_dim,
+            n_input_features=hidden_dim,
             manually_register_prev=True, manually_register_next=True
         )
+        
+        # V projection
         self.v_proj = SGXLinearBase(
             sid, f"{name_prefix}_v_proj", get_mode(f"{name_prefix}_v_proj"),
             batch_size=self.tokens,
-            n_output_features=embed_dim,
-            n_input_features=embed_dim,
+            n_output_features=hidden_dim,
+            n_input_features=hidden_dim,
             manually_register_prev=True, manually_register_next=True
         )
         self.layers.extend([self.q_proj, self.k_proj, self.v_proj])
         
-        # Reshape QKV: (B, N, 3*embed_dim) -> (3, B, num_heads, N, head_dim)
-        # We'll split this into Q, K, V reshapes for clarity
+        # Reshape Q, K, V
         self.reshape_q = SecretReshapeLayer(
             sid, f"{name_prefix}_reshape_q", get_mode(f"{name_prefix}_reshape_q"),
             target_shape=[batch_size, seq_len, num_heads, self.head_dim],
-            permute_dims=[0, 2, 1, 3],  # (B, H, N, D)
+            permute_dims=[0, 2, 1, 3],
             mode='view_permute',
             manually_register_prev=True, manually_register_next=True
         )
@@ -116,7 +117,7 @@ class MultiHeadSelfAttention:
         self.reshape_k = SecretReshapeLayer(
             sid, f"{name_prefix}_reshape_k", get_mode(f"{name_prefix}_reshape_k"),
             target_shape=[batch_size, seq_len, num_heads, self.head_dim],
-            permute_dims=[0, 2, 1, 3],  # (B, H, N, D)
+            permute_dims=[0, 2, 1, 3],
             mode='view_permute',
             manually_register_prev=True, manually_register_next=True
         )
@@ -125,22 +126,22 @@ class MultiHeadSelfAttention:
         self.reshape_v = SecretReshapeLayer(
             sid, f"{name_prefix}_reshape_v", get_mode(f"{name_prefix}_reshape_v"),
             target_shape=[batch_size, seq_len, num_heads, self.head_dim],
-            permute_dims=[0, 2, 1, 3],  # (B, H, N, D)
+            permute_dims=[0, 2, 1, 3],
             mode='view_permute',
             manually_register_prev=True, manually_register_next=True
         )
         self.layers.append(self.reshape_v)
         
-        # Q @ K^T: (B, H, N, D) @ (B, H, D, N) -> (B, H, N, N)
+        # Q @ K^T with scaling
         self.qk_matmul = SecretMatMulLayer(
             sid, f"{name_prefix}_qk_matmul", get_mode(f"{name_prefix}_qk_matmul"),
-            transpose_b=True,  # Transpose K
-            scale=1.0 / math.sqrt(self.head_dim),  # Scale by 1/sqrt(d_k)
+            transpose_b=True,
+            scale=1.0 / math.sqrt(self.head_dim),
             manually_register_prev=True, manually_register_next=True
         )
         self.layers.append(self.qk_matmul)
         
-        # Softmax: (B, H, N, N) -> (B, H, N, N)
+        # Softmax
         self.attn_softmax = SecretSoftmaxLayer(
             sid, f"{name_prefix}_attn_softmax", get_mode(f"{name_prefix}_attn_softmax"),
             dim=-1,
@@ -148,7 +149,7 @@ class MultiHeadSelfAttention:
         )
         self.layers.append(self.attn_softmax)
         
-        # Attention @ V: (B, H, N, N) @ (B, H, N, D) -> (B, H, N, D)
+        # Attention @ V
         self.attn_v_matmul = SecretMatMulLayer(
             sid, f"{name_prefix}_attn_v_matmul", get_mode(f"{name_prefix}_attn_v_matmul"),
             transpose_b=False,
@@ -156,68 +157,59 @@ class MultiHeadSelfAttention:
         )
         self.layers.append(self.attn_v_matmul)
         
-        # Reshape back: (B, H, N, D) -> (B, N, embed_dim)
+        # Reshape back
         self.reshape_concat = SecretReshapeLayer(
             sid, f"{name_prefix}_reshape_concat", get_mode(f"{name_prefix}_reshape_concat"),
             target_shape=[batch_size, num_heads, seq_len, self.head_dim],
-            permute_dims=[0, 2, 1, 3],  # (B, N, H, D)
+            permute_dims=[0, 2, 1, 3],
             mode='view_permute',
             manually_register_prev=True, manually_register_next=True
         )
         self.layers.append(self.reshape_concat)
         
-        # Flatten heads: (B, N, H, D) -> (B, N, embed_dim)
-        # We flatten to 2D (tokens, embed_dim) to be compatible with SGXLinearBase.
+        # Flatten heads
         self.flatten_heads = SecretReshapeLayer(
             sid, f"{name_prefix}_flatten_heads", get_mode(f"{name_prefix}_flatten_heads"),
-            target_shape=[batch_size * seq_len, embed_dim],
+            target_shape=[batch_size * seq_len, hidden_dim],
             mode='view',
             manually_register_prev=True, manually_register_next=True
         )
         self.layers.append(self.flatten_heads)
         
-        # Output projection: (B, N, embed_dim) -> (B, N, embed_dim)
+        # Output projection
         self.out_proj = SGXLinearBase(
             sid, f"{name_prefix}_out_proj", get_mode(f"{name_prefix}_out_proj"),
             batch_size=self.tokens,
-            n_output_features=embed_dim,
-            n_input_features=embed_dim,
+            n_output_features=hidden_dim,
+            n_input_features=hidden_dim,
             manually_register_prev=True, manually_register_next=True
         )
         self.layers.append(self.out_proj)
         
-        # Store key layers for connection
         self.input_layer = self.q_proj
         self.output_layer = self.out_proj
     
     def connect(self, prev_layer):
         """Connect attention module to previous layer."""
-        # Q/K/V projections connect to input
         self.q_proj.register_prev_layer(prev_layer)
         self.k_proj.register_prev_layer(prev_layer)
         self.v_proj.register_prev_layer(prev_layer)
         
-        # Reshape each projection to (B, H, N, head_dim)
         self.reshape_q.register_prev_layer(self.q_proj)
         self.reshape_k.register_prev_layer(self.k_proj)
         self.reshape_v.register_prev_layer(self.v_proj)
         
-        # Q @ K^T
         self.qk_matmul.register_prev_layer(self.reshape_q)
         self.qk_matmul.register_prev_layer(self.reshape_k)
         
-        # Softmax
         self.attn_softmax.register_prev_layer(self.qk_matmul)
         
-        # Attention @ V
         self.attn_v_matmul.register_prev_layer(self.attn_softmax)
         self.attn_v_matmul.register_prev_layer(self.reshape_v)
         
-        # Reshape back
         self.reshape_concat.register_prev_layer(self.attn_v_matmul)
         self.flatten_heads.register_prev_layer(self.reshape_concat)
         
-        # Output projection
         self.out_proj.register_prev_layer(self.flatten_heads)
         
         return self.out_proj
@@ -225,12 +217,12 @@ class MultiHeadSelfAttention:
 
 class FFN:
     """
-    Feed-Forward Network (MLP) module.
+    Feed-Forward Network (MLP) module for ALBERT.
     
     Structure:
-    - Linear(embed_dim, 4*embed_dim)
+    - Linear(hidden_dim, intermediate_size)
     - GELU activation
-    - Linear(4*embed_dim, embed_dim)
+    - Linear(intermediate_size, hidden_dim)
     """
     
     def __init__(
@@ -238,31 +230,30 @@ class FFN:
         sid: int,
         name_prefix: str,
         enclave_mode: ExecutionModeOptions,
-        embed_dim: int,
+        hidden_dim: int,
+        intermediate_size: int,
         batch_size: int,
         seq_len: int,
-        mlp_ratio: float = 4.0,
         layer_mode_overrides: Optional[Dict[str, ExecutionModeOptions]] = None,
     ):
         self.layers = []
-        self.hidden_dim = int(embed_dim * mlp_ratio)
         self.tokens = batch_size * seq_len
         overrides = layer_mode_overrides or {}
         
         def get_mode(name):
             return overrides.get(name, enclave_mode)
         
-        # FC1: (tokens, embed_dim) -> (tokens, hidden_dim)
+        # FC1
         self.fc1 = SGXLinearBase(
             sid, f"{name_prefix}_fc1", get_mode(f"{name_prefix}_fc1"),
             batch_size=self.tokens,
-            n_output_features=self.hidden_dim,
-            n_input_features=embed_dim,
+            n_output_features=intermediate_size,
+            n_input_features=hidden_dim,
             manually_register_prev=True, manually_register_next=True
         )
         self.layers.append(self.fc1)
         
-        # GELU activation
+        # GELU
         self.gelu = SecretGELULayer(
             sid, f"{name_prefix}_gelu", get_mode(f"{name_prefix}_gelu"),
             approximate=True,
@@ -270,12 +261,12 @@ class FFN:
         )
         self.layers.append(self.gelu)
         
-        # FC2: (tokens, hidden_dim) -> (tokens, embed_dim)
+        # FC2
         self.fc2 = SGXLinearBase(
             sid, f"{name_prefix}_fc2", get_mode(f"{name_prefix}_fc2"),
             batch_size=self.tokens,
-            n_output_features=embed_dim,
-            n_input_features=self.hidden_dim,
+            n_output_features=hidden_dim,
+            n_input_features=intermediate_size,
             manually_register_prev=True, manually_register_next=True
         )
         self.layers.append(self.fc2)
@@ -291,13 +282,17 @@ class FFN:
         return self.fc2
 
 
-class TransformerBlock:
+class ALBERTEncoderBlock:
     """
-    Single Transformer block (encoder layer).
+    Single ALBERT Encoder block.
     
-    Structure:
-    - norm1 -> attn -> residual1 (add with input)
-    - norm2 -> ffn -> residual2 (add with residual1)
+    Structure (post-norm style like BERT):
+    - attn -> residual1 -> norm1
+    - ffn -> residual2 -> norm2
+    
+    Note: In ALBERT, all encoder blocks share the SAME parameters.
+    For profiling, we still instantiate separate layer objects but
+    they would share weights in a real implementation.
     """
     
     def __init__(
@@ -305,11 +300,11 @@ class TransformerBlock:
         sid: int,
         name_prefix: str,
         enclave_mode: ExecutionModeOptions,
-        embed_dim: int,
+        hidden_dim: int,
         num_heads: int,
-        mlp_ratio: float = 4.0,
+        intermediate_size: int,
         batch_size: int = 1,
-        seq_len: int = 197,
+        seq_len: int = 128,
         layer_mode_overrides: Optional[Dict[str, ExecutionModeOptions]] = None,
     ):
         self.layers = []
@@ -318,128 +313,130 @@ class TransformerBlock:
         def get_mode(name):
             return overrides.get(name, enclave_mode)
         
-        # Pre-norm 1 (before attention)
-        self.norm1 = SecretLayerNormLayer(
-            sid, f"{name_prefix}_norm1", get_mode(f"{name_prefix}_norm1"),
-            normalized_shape=[embed_dim],
-            manually_register_prev=True, manually_register_next=True
-        )
-        self.layers.append(self.norm1)
-        
         # Multi-Head Self-Attention
         self.attn = MultiHeadSelfAttention(
             sid, f"{name_prefix}_attn", enclave_mode,
-            embed_dim=embed_dim, num_heads=num_heads,
+            hidden_dim=hidden_dim, num_heads=num_heads,
             batch_size=batch_size, seq_len=seq_len,
             layer_mode_overrides=overrides
         )
         self.layers.extend(self.attn.layers)
         
-        # Residual 1 (input + attn output)
+        # Residual 1
         self.residual1 = SecretAddLayer(
             sid, f"{name_prefix}_residual1", get_mode(f"{name_prefix}_residual1"),
             manually_register_prev=True, manually_register_next=True
         )
         self.layers.append(self.residual1)
         
-        # Pre-norm 2 (before FFN)
-        self.norm2 = SecretLayerNormLayer(
-            sid, f"{name_prefix}_norm2", get_mode(f"{name_prefix}_norm2"),
-            normalized_shape=[embed_dim],
+        # Post-norm 1 (after attention)
+        self.norm1 = SecretLayerNormLayer(
+            sid, f"{name_prefix}_norm1", get_mode(f"{name_prefix}_norm1"),
+            normalized_shape=[hidden_dim],
             manually_register_prev=True, manually_register_next=True
         )
-        self.layers.append(self.norm2)
+        self.layers.append(self.norm1)
         
         # FFN
         self.ffn = FFN(
             sid, f"{name_prefix}_ffn", enclave_mode,
-            embed_dim=embed_dim, mlp_ratio=mlp_ratio,
+            hidden_dim=hidden_dim, intermediate_size=intermediate_size,
             batch_size=batch_size, seq_len=seq_len,
             layer_mode_overrides=overrides
         )
         self.layers.extend(self.ffn.layers)
         
-        # Residual 2 (residual1 + ffn output)
+        # Residual 2
         self.residual2 = SecretAddLayer(
             sid, f"{name_prefix}_residual2", get_mode(f"{name_prefix}_residual2"),
             manually_register_prev=True, manually_register_next=True
         )
         self.layers.append(self.residual2)
         
-        self.input_layer = self.norm1
-        self.output_layer = self.residual2
+        # Post-norm 2 (after FFN)
+        self.norm2 = SecretLayerNormLayer(
+            sid, f"{name_prefix}_norm2", get_mode(f"{name_prefix}_norm2"),
+            normalized_shape=[hidden_dim],
+            manually_register_prev=True, manually_register_next=True
+        )
+        self.layers.append(self.norm2)
+        
+        self.input_layer = self.attn.input_layer
+        self.output_layer = self.norm2
     
     def connect(self, prev_layer):
-        """Connect transformer block to previous layer."""
-        # Norm1 -> Attention
-        self.norm1.register_prev_layer(prev_layer)
-        self.attn.connect(self.norm1)
+        """Connect encoder block to previous layer."""
+        # Attention
+        self.attn.connect(prev_layer)
         
         # Residual1: input + attention output
-        self.residual1.register_prev_layer(prev_layer)  # Skip connection
+        self.residual1.register_prev_layer(prev_layer)
         self.residual1.register_prev_layer(self.attn.output_layer)
         
-        # Norm2 -> FFN
-        self.norm2.register_prev_layer(self.residual1)
-        self.ffn.connect(self.norm2)
+        # Norm1
+        self.norm1.register_prev_layer(self.residual1)
         
-        # Residual2: residual1 + ffn output
-        self.residual2.register_prev_layer(self.residual1)  # Skip connection
+        # FFN
+        self.ffn.connect(self.norm1)
+        
+        # Residual2: norm1 + ffn output
+        self.residual2.register_prev_layer(self.norm1)
         self.residual2.register_prev_layer(self.ffn.output_layer)
         
-        return self.residual2
+        # Norm2
+        self.norm2.register_prev_layer(self.residual2)
+        
+        return self.norm2
 
 
-class SGXViTBase:
+class SGXALBERTBase:
     """
-    Vision Transformer Base model for SGX inference.
+    ALBERT model for SGX inference.
     
-    Architecture (ViT-Base):
-    - Patch Embedding: Conv2d(3, 768, kernel=16, stride=16)
-    - Position Embedding: Added to patches (learnable)
-    - CLS Token: Prepended to sequence
-    - 12 Transformer Blocks
-    - Classification Head: LayerNorm -> Linear
+    Architecture:
+    - Factorized Embedding: E-dim embeddings projected to H-dim
+    - N Transformer Encoder Blocks (with shared parameters!)
+    - Pooler: Linear + Tanh
+    - Classifier: Linear
     
-    Configurations:
-    - ViT-Tiny: embed_dim=192, num_heads=3, num_layers=12
-    - ViT-Small: embed_dim=384, num_heads=6, num_layers=12  
-    - ViT-Base: embed_dim=768, num_heads=12, num_layers=12
-    - ViT-Large: embed_dim=1024, num_heads=16, num_layers=24
+    Configuration (ALBERT-base):
+    - embedding_dim E: 128
+    - hidden_dim H: 768
+    - num_heads: 12
+    - num_layers: 12 (shared parameters!)
+    - intermediate_size: 3072
+    
+    Key Benefit: ~90% fewer unique parameters than BERT due to sharing!
     """
     
     def __init__(
         self,
         sid: int = 0,
-        num_classes: int = 1000,
+        num_classes: int = 2,
         enclave_mode: ExecutionModeOptions = ExecutionModeOptions.Enclave,
         batch_size: int = 1,
-        img_size: int = 224,
-        patch_size: int = 16,
-        embed_dim: int = 768,
+        seq_len: int = 128,
+        embedding_dim: int = 128,
+        hidden_dim: int = 768,
         num_heads: int = 12,
         num_layers: int = 12,
-        mlp_ratio: float = 4.0,
+        intermediate_size: int = 3072,
         layer_mode_overrides: Optional[Dict[str, ExecutionModeOptions]] = None,
     ):
         self.sid = sid
         self.num_classes = num_classes
         self.enclave_mode = enclave_mode
         self.batch_size = batch_size
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.embed_dim = embed_dim
+        self.seq_len = seq_len
+        self.embedding_dim = embedding_dim
+        self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         self.num_layers = num_layers
-        self.mlp_ratio = mlp_ratio
+        self.intermediate_size = intermediate_size
         self.layer_mode_overrides = layer_mode_overrides or {}
         
-        # Computed values
-        self.num_patches = (img_size // patch_size) ** 2  # 196 for 224/16
-        self.seq_len = self.num_patches + 1  # +1 for CLS token
-        
         self.layers: List = []
-        self.model_name = f"ViT-{embed_dim}"
+        self.model_name = f"ALBERT-{hidden_dim}"
         
         self._build_network()
     
@@ -447,71 +444,31 @@ class SGXViTBase:
         return self.layer_mode_overrides.get(name, self.enclave_mode)
     
     def _build_network(self):
-        """Build complete ViT network."""
+        """Build complete ALBERT network."""
         sid = self.sid
+        tokens = self.batch_size * self.seq_len
         
         # ========== Input Layer ==========
         input_layer = SecretInputLayer(
             sid, "input",
-            [self.batch_size, 3, self.img_size, self.img_size],
+            [tokens, self.hidden_dim],  # Already projected to H-dim
             self._get_mode("input"),
             manually_register_next=True
         )
         self.layers.append(input_layer)
         
-        # ========== Patch Embedding ==========
-        # Conv2d: (B, 3, H, W) -> (B, embed_dim, H/16, W/16)
-        patch_embed = SGXConvBase(
-            sid, "patch_embed", self._get_mode("patch_embed"),
-            n_output_channel=self.embed_dim,
-            n_input_channel=3,
-            filter_hw=self.patch_size,
-            stride=self.patch_size,
-            padding=0,
-            batch_size=self.batch_size,
-            img_hw=self.img_size,
-            manually_register_prev=True, manually_register_next=True
-        )
-        patch_embed.register_prev_layer(input_layer)
-        self.layers.append(patch_embed)
-
-        # Tokenize patches:
-        # conv output: (B, embed_dim, H', W') where H'=W'=img_size/patch_size
-        # tokens:      (B*num_patches, embed_dim)
-        num_patches_hw = self.img_size // self.patch_size
-        num_patches = num_patches_hw * num_patches_hw
-        # This native model omits CLS token; keep seq_len consistent with conv output.
-        self.seq_len = num_patches
-
-        reshape_tokens_3d = SecretReshapeLayer(
-            sid, "reshape_tokens_3d", self._get_mode("reshape_tokens_3d"),
-            target_shape=[self.batch_size, self.embed_dim, -1],
-            permute_dims=[0, 2, 1],  # (B, num_patches, embed_dim)
-            mode='view_permute',
-            manually_register_prev=True, manually_register_next=True
-        )
-        reshape_tokens_3d.register_prev_layer(patch_embed)
-        self.layers.append(reshape_tokens_3d)
-
-        reshape_tokens_2d = SecretReshapeLayer(
-            sid, "reshape_tokens_2d", self._get_mode("reshape_tokens_2d"),
-            target_shape=[self.batch_size * num_patches, self.embed_dim],
-            mode='view',
-            manually_register_prev=True, manually_register_next=True
-        )
-        reshape_tokens_2d.register_prev_layer(reshape_tokens_3d)
-        self.layers.append(reshape_tokens_2d)
-
-        current_output = reshape_tokens_2d
+        current_output = input_layer
         
-        # ========== Transformer Blocks ==========
+        # ========== Encoder Blocks (with shared parameters) ==========
+        # Note: In ALBERT, all blocks share the same parameters
+        # For profiling, we still measure each invocation separately
         for i in range(self.num_layers):
-            block = TransformerBlock(
-                sid, f"block{i}",
+            block = ALBERTEncoderBlock(
+                sid, f"encoder{i}",
                 self.enclave_mode,
-                embed_dim=self.embed_dim,
+                hidden_dim=self.hidden_dim,
                 num_heads=self.num_heads,
-                mlp_ratio=self.mlp_ratio,
+                intermediate_size=self.intermediate_size,
                 batch_size=self.batch_size,
                 seq_len=self.seq_len,
                 layer_mode_overrides=self.layer_mode_overrides
@@ -519,28 +476,26 @@ class SGXViTBase:
             current_output = block.connect(current_output)
             self.layers.extend(block.layers)
         
-        # ========== Classification Head ==========
-        # Final LayerNorm
-        head_norm = SecretLayerNormLayer(
-            sid, "head_norm", self._get_mode("head_norm"),
-            normalized_shape=[self.embed_dim],
+        # ========== Pooler (Linear + Tanh) ==========
+        pooler = SGXLinearBase(
+            sid, "pooler", self._get_mode("pooler"),
+            batch_size=tokens,
+            n_output_features=self.hidden_dim,
+            n_input_features=self.hidden_dim,
             manually_register_prev=True, manually_register_next=True
         )
-        head_norm.register_prev_layer(current_output)
-        self.layers.append(head_norm)
+        pooler.register_prev_layer(current_output)
+        self.layers.append(pooler)
         
-        # Note: We only use the CLS token for classification
-        # This would require a slice operation, simplified here
-        
-        # Classification Linear: (B, embed_dim) -> (B, num_classes)
+        # ========== Classifier ==========
         classifier = SGXLinearBase(
             sid, "classifier", self._get_mode("classifier"),
-            batch_size=self.batch_size * self.seq_len,
+            batch_size=tokens,
             n_output_features=self.num_classes,
-            n_input_features=self.embed_dim,
+            n_input_features=self.hidden_dim,
             manually_register_prev=True, manually_register_next=True
         )
-        classifier.register_prev_layer(head_norm)
+        classifier.register_prev_layer(pooler)
         self.layers.append(classifier)
         
         # Output layer
@@ -564,7 +519,6 @@ class SGXViTBase:
     
     def get_model_info(self) -> Dict:
         """Return model configuration and statistics."""
-        total_params = 0
         layer_counts = {}
         
         for layer in self.layers:
@@ -574,14 +528,15 @@ class SGXViTBase:
         return {
             "model_name": self.model_name,
             "num_classes": self.num_classes,
-            "embed_dim": self.embed_dim,
+            "embedding_dim": self.embedding_dim,
+            "hidden_dim": self.hidden_dim,
             "num_heads": self.num_heads,
             "num_layers": self.num_layers,
-            "num_patches": self.num_patches,
+            "intermediate_size": self.intermediate_size,
             "seq_len": self.seq_len,
-            "mlp_ratio": self.mlp_ratio,
             "total_layers": len(self.layers),
             "layer_type_counts": layer_counts,
+            "parameter_sharing": True,
         }
     
     def print_architecture(self):
@@ -591,74 +546,50 @@ class SGXViTBase:
         print(f"Model: {info['model_name']}")
         print(f"{'='*60}")
         print(f"Configuration:")
-        print(f"  - Embedding dim: {info['embed_dim']}")
+        print(f"  - Embedding dim E: {info['embedding_dim']} (factorized)")
+        print(f"  - Hidden dim H: {info['hidden_dim']}")
         print(f"  - Num heads: {info['num_heads']}")
-        print(f"  - Num layers: {info['num_layers']}")
+        print(f"  - Num layers: {info['num_layers']} (parameters SHARED!)")
+        print(f"  - Intermediate size: {info['intermediate_size']}")
         print(f"  - Sequence length: {info['seq_len']}")
-        print(f"  - MLP ratio: {info['mlp_ratio']}")
         print(f"\nLayer counts:")
         for layer_type, count in sorted(info['layer_type_counts'].items()):
             print(f"  - {layer_type}: {count}")
         print(f"\nTotal layers: {info['total_layers']}")
+        print(f"Note: ALBERT uses cross-layer parameter sharing!")
         print(f"{'='*60}\n")
 
 
-def create_vit_tiny(num_classes=1000, **kwargs):
-    """Create ViT-Tiny model."""
-    return SGXViTBase(
+def create_albert_base(num_classes=2, **kwargs):
+    """Create ALBERT-base model."""
+    return SGXALBERTBase(
         num_classes=num_classes,
-        embed_dim=192,
-        num_heads=3,
-        num_layers=12,
-        **kwargs
-    )
-
-
-def create_vit_small(num_classes=1000, **kwargs):
-    """Create ViT-Small model."""
-    return SGXViTBase(
-        num_classes=num_classes,
-        embed_dim=384,
-        num_heads=6,
-        num_layers=12,
-        **kwargs
-    )
-
-
-def create_vit_base(num_classes=1000, **kwargs):
-    """Create ViT-Base model."""
-    return SGXViTBase(
-        num_classes=num_classes,
-        embed_dim=768,
+        embedding_dim=128,
+        hidden_dim=768,
         num_heads=12,
         num_layers=12,
+        intermediate_size=3072,
+        seq_len=128,
         **kwargs
     )
 
 
-def create_vit_large(num_classes=1000, **kwargs):
-    """Create ViT-Large model."""
-    return SGXViTBase(
+def create_albert_large(num_classes=2, **kwargs):
+    """Create ALBERT-large model."""
+    return SGXALBERTBase(
         num_classes=num_classes,
-        embed_dim=1024,
+        embedding_dim=128,
+        hidden_dim=1024,
         num_heads=16,
         num_layers=24,
+        intermediate_size=4096,
+        seq_len=128,
         **kwargs
     )
 
 
 if __name__ == "__main__":
-    # Test model creation
-    print("Creating ViT models...")
+    print("Creating ALBERT model...")
     
-    for name, factory in [
-        ("ViT-Tiny", create_vit_tiny),
-        ("ViT-Small", create_vit_small),
-        ("ViT-Base", create_vit_base),
-    ]:
-        print(f"\n{name}:")
-        model = factory(num_classes=10, enclave_mode=ExecutionModeOptions.CPU)
-        model.print_architecture()
-
-
-
+    model = create_albert_base(num_classes=2, enclave_mode=ExecutionModeOptions.CPU)
+    model.print_architecture()

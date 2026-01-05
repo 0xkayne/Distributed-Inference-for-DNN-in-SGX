@@ -61,8 +61,20 @@ class SecretSoftmaxLayer(SecretActivationLayer):
         TensorLoader.init(self, start_enclave)
         
         if self.EnclaveMode is ExecutionModeOptions.Enclave:
-            # TODO: Initialize native enclave Softmax when implemented
-            pass
+            # Calculate total_elements and softmax_dim
+            import numpy as np
+            total_elements = int(np.prod(self.InputShape))
+            
+            # softmax_dim is the size of the dimension we're applying softmax over
+            resolved_dim = self.dim if self.dim >= 0 else len(self.InputShape) + self.dim
+            softmax_dim = self.InputShape[resolved_dim]
+            
+            # Initialize native enclave Softmax
+            self.softmax_init(
+                self.LayerName,
+                "input", "output",
+                total_elements, softmax_dim
+            )
         elif self.EnclaveMode is ExecutionModeOptions.GPU:
             # Nothing special needed for GPU
             pass
@@ -103,18 +115,11 @@ class SecretSoftmaxLayer(SecretActivationLayer):
         """Forward pass."""
         with NamedTimerInstance(f"S{self.sid}: {self.LayerName} Forward", verbose_level=VerboseLevel.LAYER):
             if self.EnclaveMode == ExecutionModeOptions.Enclave:
-                # For Enclave mode: transfer to CPU, compute, transfer back
-                with NamedTimerInstance(f"  S{self.sid}: {self.LayerName} Enclave->CPU", verbose_level=VerboseLevel.LAYER):
+                # Native Enclave execution
+                with NamedTimerInstance(f"  S{self.sid}: {self.LayerName} Input Preprocess", verbose_level=VerboseLevel.LAYER):
                     self.forward_tensor_transfer()
-                    self.transfer_enclave_to_cpu("input")
-                
-                with NamedTimerInstance(f"  S{self.sid}: {self.LayerName} CPU Compute", verbose_level=VerboseLevel.LAYER):
-                    input_data = self.get_cpu("input")
-                    output = self._stable_softmax(input_data, dim=self.dim)
-                    self.set_cpu("output", output)
-                
-                with NamedTimerInstance(f"  S{self.sid}: {self.LayerName} CPU->Enclave", verbose_level=VerboseLevel.LAYER):
-                    self.transfer_cpu_to_enclave("output")
+                with NamedTimerInstance(f"  S{self.sid}: {self.LayerName} softmax_forward", verbose_level=VerboseLevel.LAYER):
+                    self.softmax_forward(self.LayerName)
                     
             elif self.EnclaveMode == ExecutionModeOptions.CPU:
                 self.forward_tensor_transfer()
@@ -141,5 +146,6 @@ class SecretSoftmaxLayer(SecretActivationLayer):
             get_relative=False, show_values=False
         )
         print(f"S{self.sid}: {self.LayerName} Forward Error: {err}")
+
 
 

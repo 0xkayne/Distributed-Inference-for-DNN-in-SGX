@@ -98,7 +98,7 @@ Crypto_Library_Name := sgx_tcrypto
 
 Enclave_Cpp_Files := Enclave/Enclave.cpp Enclave/sgxdnn.cpp 
 SGXDNN_Cpp_Files := sgxdnn_main.cpp chunk_manager.cpp secret_tensor.cpp xoshiro.cpp stochastic.cpp Crypto.cpp sgxaes.cpp aes-stream.cpp utils.cpp 
-SGXDNN_Layer_Cpp_Files := layers/batchnorm.cpp layers/linear.cpp layers/conv.cpp layers/maxpool.cpp
+SGXDNN_Layer_Cpp_Files := layers/batchnorm.cpp layers/linear.cpp layers/conv.cpp layers/maxpool.cpp layers/layernorm.cpp layers/softmax.cpp layers/gelu.cpp layers/matmul.cpp
 #SGXDNN_Cpp_Files += aesni_ghash.cpp aesni_key.cpp  aesni-wrap.cpp
 Enclave_Include_Paths := -IEnclave -I$(SGX_SDK)/include -I$(SGX_SDK)/include/tlibc -I$(SGX_SDK)/include/libcxx
 GCC_INCLUDE_PATH := $(shell $(CC) -print-file-name=include)

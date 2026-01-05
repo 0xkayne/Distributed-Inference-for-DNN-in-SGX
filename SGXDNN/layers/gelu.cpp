@@ -4,6 +4,8 @@
 
 #include "gelu.hpp"
 #include "chunk_manager.hpp"
+#include "layer_timing.hpp"
+#include "runtime_stats_api.hpp"
 
 #include <cmath>
 #include <algorithm>
@@ -58,27 +60,49 @@ void GELUBuffer::forward() {
     
     DtypeForCpuOp *data_chunk;
     ChunkGuard<DtypeForCpuOp> data_guard(StoreChunkPool::GetChunkPool(), data_chunk);
+
+    double get_ms = 0.0;
+    double compute_ms = 0.0;
+    double store_ms = 0.0;
     
     run_all_chunks([&](int start_elem, int num_elem_in_chunk) {
         int chunk_size_in_byte = num_elem_in_chunk * sizeof(DtypeForCpuOp);
         
         // Load input chunk
-        chunk_manager.GetChunk(input_tensor->GetChunkId(start_elem), data_chunk, chunk_size_in_byte);
+        {
+            auto t0 = layer_now_us();
+            chunk_manager.GetChunk(input_tensor->GetChunkId(start_elem), data_chunk, chunk_size_in_byte);
+            auto t1 = layer_now_us();
+            get_ms += layer_elapsed_ms(t0, t1);
+        }
         
         // Apply GELU element-wise
-        if (use_approximate) {
-            for (int i = 0; i < num_elem_in_chunk; i++) {
-                data_chunk[i] = gelu_approximate(data_chunk[i]);
+        {
+            auto t0 = layer_now_us();
+            if (use_approximate) {
+                for (int i = 0; i < num_elem_in_chunk; i++) {
+                    data_chunk[i] = gelu_approximate(data_chunk[i]);
+                }
+            } else {
+                for (int i = 0; i < num_elem_in_chunk; i++) {
+                    data_chunk[i] = gelu_exact(data_chunk[i]);
+                }
             }
-        } else {
-            for (int i = 0; i < num_elem_in_chunk; i++) {
-                data_chunk[i] = gelu_exact(data_chunk[i]);
-            }
+            auto t1 = layer_now_us();
+            compute_ms += layer_elapsed_ms(t0, t1);
         }
         
         // Store output chunk
-        chunk_manager.StoreChunk(output_tensor->GetChunkId(start_elem), data_chunk, chunk_size_in_byte);
+        {
+            auto t0 = layer_now_us();
+            chunk_manager.StoreChunk(output_tensor->GetChunkId(start_elem), data_chunk, chunk_size_in_byte);
+            auto t1 = layer_now_us();
+            store_ms += layer_elapsed_ms(t0, t1);
+        }
     }, STORE_CHUNK_ELEM, num_elements);
+
+    SecretSetLayerRuntimeStats(FunId, get_ms, compute_ms, store_ms, 0.0, 0.0, 1);
 }
+
 
 

@@ -118,3 +118,4 @@ class SecretScaleLayer(SecretActivationLayer):
         print(f"S{self.sid}: {self.LayerName} Forward Error: {err}")
 
 
+

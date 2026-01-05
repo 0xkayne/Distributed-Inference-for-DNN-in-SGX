@@ -22,11 +22,12 @@
 - [4. 基本使用](#4-基本使用)
 - [5. 实验指南](#5-实验指南)
 - [6. 代码结构](#6-代码结构)
-- [7. STORE_CHUNK_ELEM 配置参考](#7-store_chunk_elem-配置参考)
-- [8. 故障排除](#8-故障排除)
-- [9. 主要结果](#9-主要结果)
-- [10. 假设与限制](#10-假设与限制)
-- [11. 引用](#11-引用)
+- [7. Chunk 内存管理机制](#7-chunk-内存管理机制)
+- [8. STORE_CHUNK_ELEM 配置参考](#8-store_chunk_elem-配置参考)
+- [9. 故障排除](#9-故障排除)
+- [10. 主要结果](#10-主要结果)
+- [11. 假设与限制](#11-假设与限制)
+- [12. 引用](#12-引用)
 
 ---
 
@@ -322,11 +323,265 @@ TAOISM/
 
 ---
 
-## 7. STORE_CHUNK_ELEM 配置参考
+## 7. Chunk 内存管理机制
+
+本节详细介绍 SGX Enclave 中用于管理大规模张量数据的 Chunk 机制，这是理解系统性能和内存行为的关键。
+
+### 7.1 设计动机
+
+SGX Enclave 的 **EPC (Enclave Page Cache)** 内存有限（通常 128MB-256MB），而 DNN 模型的张量可能很大（几十到几百 MB）。因此不能把所有数据都放在 EPC 中。
+
+**解决方案**：将大张量分割成多个小块 (chunks)，使用 **AES-GCM** 加密后存储在 **非可信内存 (Untrusted Memory)** 中，需要时再解密回 Enclave 内部处理。
+
+### 7.2 系统架构图
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                           SGX Enclave (EPC Memory)                           │
+│  ┌─────────────────────────────────────────────────────────────────────────┐ │
+│  │                        ChunkPool (工作缓冲区)                            │ │
+│  │  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐    │ │
+│  │  │  Chunk 0     │ │  Chunk 1     │ │  Chunk 2     │ │  Chunk 3     │    │ │
+│  │  │ (~16MB each) │ │ (~16MB each) │ │ (~16MB each) │ │ (~16MB each) │    │ │
+│  │  └──────────────┘ └──────────────┘ └──────────────┘ └──────────────┘    │ │
+│  │              THREAD_POOL_SIZE × 2 = 8 个工作 chunks                      │ │
+│  └─────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────────┐ │
+│  │                       Blind Chunks (解密临时缓冲区)                       │ │
+│  │  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐    │ │
+│  │  │  Blind 0     │ │  Blind 1     │ │  Blind 2     │ │  Blind 3     │    │ │
+│  │  └──────────────┘ └──────────────┘ └──────────────┘ └──────────────┘    │ │
+│  │                    THREAD_POOL_SIZE = 4 个 blind chunks                  │ │
+│  └─────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│          ↑ GetChunk() 解密                  ↓ StoreChunk() 加密              │
+└──────────────────────────────────────────────────────────────────────────────┘
+                              │                              │
+                    AES-GCM Decrypt              AES-GCM Encrypt
+                              │                              │
+                              ↓                              ↓
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                        Untrusted Memory (非可信内存)                          │
+│  ┌─────────────────────────────────────────────────────────────────────────┐ │
+│  │                   Encrypted Tensor Storage                              │ │
+│  │                                                                         │ │
+│  │  Tensor A (stem_conv1 input):                                           │ │
+│  │  ┌─────────────────────────────────────────┐                            │ │
+│  │  │ [IV|TAG|Encrypted Chunk 0] chunk_id=1001│                            │ │
+│  │  └─────────────────────────────────────────┘                            │ │
+│  │                                                                         │ │
+│  │  Tensor B (stem_conv1 output):                                          │ │
+│  │  ┌─────────────────────────────────────────┐                            │ │
+│  │  │ [IV|TAG|Encrypted Chunk 0] chunk_id=1002│                            │ │
+│  │  └─────────────────────────────────────────┘                            │ │
+│  │                                                                         │ │
+│  │  Tensor C (large tensor, multiple chunks):                              │ │
+│  │  ┌────────────────────┐ ┌────────────────────┐ ┌────────────────────┐   │ │
+│  │  │ Enc Chunk 0 id=1003│ │ Enc Chunk 1 id=1004│ │ Enc Chunk 2 id=1005│   │ │
+│  │  └────────────────────┘ └────────────────────┘ └────────────────────┘   │ │
+│  └─────────────────────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 7.3 核心参数
+
+```c
+// Include/common_with_enclaves.h
+#define STORE_CHUNK_ELEM 4276896    // 每个 chunk 最多存储的元素数量
+#define THREAD_POOL_SIZE 4          // 线程池大小
+#define DtypeForCpuOp float         // 数据类型 (4 bytes)
+```
+
+**计算公式**：
+- 每个 chunk 的容量 = `STORE_CHUNK_ELEM × sizeof(float)` = `STORE_CHUNK_ELEM × 4` bytes
+- 张量分割为 `⌈total_elements / STORE_CHUNK_ELEM⌉` 个 chunks
+
+### 7.4 核心组件
+
+#### 7.4.1 ChunkPool - Enclave 内的内存池
+
+`ChunkPool` 是 Enclave 内部的工作内存池，预分配固定数量的缓冲区供 DNN 运算使用。
+
+```cpp
+// SGXDNN/chunk_manager.hpp
+class ChunkPool {
+    std::vector<void*> chunks;      // 预分配的内存块
+    std::stack<int> chunk_ids;      // 空闲 chunk ID 栈
+    bool use_edmm;                  // 是否使用 SGX2 EDMM
+};
+
+// 初始化（单例模式）
+StoreChunkPool() {
+    chunk_pool = make_shared<ChunkPool>(
+        THREAD_POOL_SIZE * 2,                    // 8 个 chunks
+        STORE_CHUNK_ELEM * sizeof(DtypeForCpuOp) // 每个约 16MB
+    );
+}
+```
+
+**特性**：
+- 使用栈 (stack) 管理空闲 chunk ID，O(1) 分配/回收
+- 支持 **EDMM (SGX2)** 动态内存管理，按需提交物理页面
+- 线程安全（使用 mutex 保护）
+
+#### 7.4.2 TrustedChunkManager - 加密存储管理器
+
+`TrustedChunkManager` 是核心管理类，负责张量数据的加密存储和解密读取。
+
+**StoreChunk() - 加密并存储到非可信内存**：
+
+```cpp
+void TrustedChunkManager::StoreChunk(IdT id, void* src_chunk, int num_byte) {
+    // 1. 计算加密后的大小（包含 IV + TAG + 密文）
+    int num_byte_enc_chunk = CalcEncDataSize(0, num_byte);
+    
+    // 2. 在非可信内存分配/获取缓冲区
+    SgxEncT* enc_chunk = (SgxEncT*) get_untrusted_mem(id, num_byte_enc_chunk);
+    
+    // 3. AES-GCM 加密
+    encrypt(
+        (uint8_t*) src_chunk,           // 明文数据
+        num_byte,                        // 数据大小
+        &enc_chunk->payload,             // 密文输出
+        &enc_chunk->reserved,            // IV (12 bytes)
+        &enc_chunk->payload_tag          // TAG (16 bytes)
+    );
+}
+```
+
+**GetChunk() - 从非可信内存解密取回**：
+
+```cpp
+void TrustedChunkManager::GetChunk(IdT id, void* dst_chunk, int num_byte) {
+    // 1. 获取加密数据指针
+    SgxEncT* enc_chunk = (SgxEncT*) get_untrusted_mem(id, num_byte_enc_chunk);
+    
+    // 2. AES-GCM 解密（带完整性验证）
+    decrypt(
+        &enc_chunk->payload,             // 密文
+        num_byte,
+        (uint8_t*) dst_chunk,            // 明文输出
+        &enc_chunk->reserved,            // IV
+        &enc_chunk->payload_tag,         // TAG（验证完整性）
+        blind_chunk                      // 临时缓冲区
+    );
+}
+```
+
+#### 7.4.3 SecretTen - 加密张量
+
+`SecretTen` 封装了加密张量的存储和访问逻辑。
+
+```cpp
+// SGXDNN/secret_tensor.cpp
+class SecretTen {
+    IdT TenId;                      // 张量 ID
+    DimsT Dims;                     // 张量维度
+    std::vector<int> ChunkIds;      // 存储此张量的 chunk ID 列表
+};
+
+void SecretTen::Init() {
+    auto chunk_op = [&](int start, int num_elem_in_op) {
+        int chunk_id = chunk_manager.GetNewId();  // 分配唯一 ID
+        ChunkIds.push_back(chunk_id);             // 记录 chunk ID
+        chunk_manager.StoreChunk(chunk_id, store_chunk, num_elem_in_op * sizeof(float));
+    };
+    
+    // 按 STORE_CHUNK_ELEM 大小分块处理
+    run_all_chunks(chunk_op, STORE_CHUNK_ELEM, GetNumElem());
+}
+```
+
+### 7.5 加密开销分析
+
+每个存储在非可信内存的 chunk 都有额外的加密元数据开销：
+
+| 组件 | 大小 (bytes) | 说明 |
+|------|-------------|------|
+| **IV (Initialization Vector)** | 12 | AES-GCM 初始化向量 |
+| **TAG (Authentication Tag)** | 16 | 完整性校验标签 |
+| **sgx_aes_gcm_data_t 结构体** | 32 | SGX SDK 内部结构 |
+| **总计** | **60** | 每个 chunk 的加密开销 |
+
+**内存开销计算**：
+```
+TEE_总内存 = 原始数据大小 + (chunk数量 × 60 bytes)
+```
+
+### 7.6 典型操作流程（以卷积为例）
+
+```
+1. forward() 开始
+   │
+   ├─► GetChunk(input_chunk_id) ─────► 解密 input 到 Enclave 工作区
+   │
+   ├─► GetChunk(weight_chunk_id) ───► 解密 weight 到 Enclave 工作区
+   │
+   ├─► 在 Enclave 内执行卷积计算
+   │
+   ├─► StoreChunk(output_chunk_id) ──► 加密 output 到非可信内存
+   │
+   └─► 返回工作区 chunk 到 ChunkPool
+```
+
+### 7.7 ChunkGuard - RAII 资源管理
+
+`ChunkGuard` 使用 RAII 模式自动管理工作缓冲区的分配和释放：
+
+```cpp
+template<typename T>
+class ChunkGuard {
+public:
+    ChunkGuard(shared_ptr<ChunkPool> pool, T*& pointer) : chunk_pool(pool) {
+        id = chunk_pool->get_chunk_id();           // 分配
+        pointer = (T*) chunk_pool->chunks[id];
+    }
+    ~ChunkGuard() {
+        chunk_pool->return_chunk_id(id);           // 自动释放
+    }
+};
+
+// 使用示例
+void some_operation() {
+    DtypeForCpuOp* work_buffer;
+    ChunkGuard<DtypeForCpuOp> guard(StoreChunkPool::GetChunkPool(), work_buffer);
+    // 使用 work_buffer 进行计算...
+    // 离开作用域时自动释放
+}
+```
+
+### 7.8 内存使用总结
+
+| 位置 | 组件 | 默认大小 | 说明 |
+|------|------|---------|------|
+| **EPC 内** | StoreChunkPool | `8 × 16MB ≈ 130MB` | 工作缓冲区 |
+| **EPC 内** | Blind Chunks | `4 × 16MB ≈ 65MB` | 解密临时缓冲区 |
+| **EPC 内** | 其他开销 | ~50MB | 代码、栈、堆元数据 |
+| **非可信内存** | 加密张量 | 模型大小 + 加密开销 | 按需分配 |
+
+**关键洞察**：
+- EPC 内只需保留固定大小的工作区（约 200-250MB），就能处理任意大小的模型
+- 张量数据加密后存储在非可信内存中，不占用 EPC
+- EDMM (SGX2) 支持按需提交物理页面，进一步优化 EPC 使用
+
+### 7.9 相关源文件
+
+| 文件 | 说明 |
+|------|------|
+| `SGXDNN/chunk_manager.hpp` | ChunkPool、TrustedChunkManager 类定义 |
+| `SGXDNN/chunk_manager.cpp` | Chunk 管理实现 |
+| `SGXDNN/secret_tensor.cpp` | SecretTen 加密张量实现 |
+| `Include/common_with_enclaves.h` | STORE_CHUNK_ELEM 等参数定义 |
+| `SGXDNN/Crypto.cpp` | AES-GCM 加密/解密实现 |
+
+---
+
+## 8. STORE_CHUNK_ELEM 配置参考
 
 `STORE_CHUNK_ELEM` 是 Enclave 内存管理的关键参数，必须根据模型输入尺寸正确配置。
 
-### 7.1 常用模型配置
+### 8.1 常用模型配置
 
 | 模型 | 输入尺寸 | STORE_CHUNK_ELEM | 说明 |
 |------|---------|------------------|------|
@@ -334,7 +589,7 @@ TAOISM/
 | **VGG16, AlexNet** | 224×224 | 802816 | ImageNet |
 | **Inception V3** | 299×299 | 见下表 | 分组配置 |
 
-### 7.2 Inception V3 分组配置
+### 8.2 Inception V3 分组配置
 
 由于 Inception V3 结构复杂，需要分组配置：
 
@@ -348,7 +603,7 @@ TAOISM/
 | **Inception-C** | 30720 | 0.12 MB | MaxPool(8×8) |
 | **Classifier** | 256000 | 0.98 MB | Linear(2048) |
 
-### 7.3 修改 STORE_CHUNK_ELEM
+### 8.3 修改 STORE_CHUNK_ELEM
 
 **方法 1：手动编辑**
 
@@ -380,7 +635,7 @@ sed -i 's/#define WORK_CHUNK_ELEM [0-9]*/#define WORK_CHUNK_ELEM 802816/' Includ
 rm -rf SGXDNN/bin_sgx && make clean && make SGX_MODE=HW all
 ```
 
-### 7.4 约束条件
+### 8.4 约束条件
 
 | 约束类型 | 条件 | 说明 |
 |---------|------|------|
@@ -388,7 +643,7 @@ rm -rf SGXDNN/bin_sgx && make clean && make SGX_MODE=HW all
 | **Conv（警告）** | `STORE_CHUNK_ELEM % (row_size × stride) == 0` | 打印警告但可运行 |
 | **Linear（重要）** | `STORE_CHUNK_ELEM % input_features == 0` | 可能影响性能 |
 
-### 7.5 内存计算
+### 8.5 内存计算
 
 ```
 每个 chunk 内存 = STORE_CHUNK_ELEM × 4 bytes (float32)
@@ -397,19 +652,19 @@ rm -rf SGXDNN/bin_sgx && make clean && make SGX_MODE=HW all
 
 ---
 
-## 8. 故障排除
+## 9. 故障排除
 
-### 8.1 常见问题
+### 9.1 常见问题
 
 | 问题 | 原因 | 解决方案 |
 |------|------|---------|
 | **Enclave 创建失败** | SGX 驱动未安装 | `ls /dev/sgx_enclave` 验证 |
-| **libstdc++ 版本错误** | Conda 环境库冲突 | 见 8.2 节 |
+| **libstdc++ 版本错误** | Conda 环境库冲突 | 见 9.2 节 |
 | **Out of EPC memory** | Enclave 内存不足 | 调整 `Enclave.config.xml` |
 | **EDMM not detected** | 硬件不支持 SGX2 | 需要 Ice Lake+ CPU |
-| **MaxPool 返回错误** | STORE_CHUNK_ELEM 配置错误 | 见第 7 节 |
+| **MaxPool 返回错误** | STORE_CHUNK_ELEM 配置错误 | 见第 8 节 |
 
-### 8.2 libstdc++ 版本冲突
+### 9.2 libstdc++ 版本冲突
 
 **问题**：
 ```
@@ -429,7 +684,7 @@ export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6
 cp /usr/lib/x86_64-linux-gnu/libstdc++.so.6 $CONDA_PREFIX/lib/
 ```
 
-### 8.3 Enclave 内存配置
+### 9.3 Enclave 内存配置
 
 编辑 `Enclave/Enclave.config.xml`：
 
@@ -447,7 +702,7 @@ cp /usr/lib/x86_64-linux-gnu/libstdc++.so.6 $CONDA_PREFIX/lib/
 make clean && make
 ```
 
-### 8.4 诊断命令
+### 9.4 诊断命令
 
 ```bash
 # 检查 SGX2/EDMM 支持
@@ -464,7 +719,7 @@ python teeslice/sgx_resnet_cifar.py --mode Enclave
 sudo dmesg | grep -i sgx
 ```
 
-### 8.5 分布式推理常见问题
+### 9.5 分布式推理常见问题
 
 | 问题 | 解决方案 |
 |------|---------|
@@ -475,9 +730,9 @@ sudo dmesg | grep -i sgx
 
 ---
 
-## 9. 主要结果
+## 10. 主要结果
 
-### 9.1 ResNet-18 分割策略对比
+### 10.1 ResNet-18 分割策略对比
 
 | 策略 | 延迟 (ms) | 加速比 | 说明 |
 |------|-----------|--------|------|
@@ -486,7 +741,7 @@ sudo dmesg | grep -i sgx
 | `pipeline_half` | **49.193** | **1.35×** | **最优：前 1/2 Enclave** |
 | `pipeline_three_quarter` | 65.184 | 1.02× | 前 3/4 Enclave |
 
-### 9.2 关键发现
+### 10.2 关键发现
 
 1. **分割点选择至关重要**：最佳分割点在网络中间，使两分区负载均衡
 2. **并行结构带来显著加速**：ResNet 残差连接提供天然并行机会
@@ -494,15 +749,15 @@ sudo dmesg | grep -i sgx
 
 ---
 
-## 10. 假设与限制
+## 11. 假设与限制
 
-### 10.1 研究假设
+### 11.1 研究假设
 
 - DNN 表示为有向无环图（DAG）
 - 分区粒度为层级
 - 当前支持 CPU/Enclave 两分区
 
-### 10.2 系统限制
+### 11.2 系统限制
 
 | 限制 | 可能的扩展 |
 |------|-----------|
@@ -512,7 +767,7 @@ sudo dmesg | grep -i sgx
 
 ---
 
-## 11. 引用
+## 12. 引用
 
 本研究基于 TAOISM 框架构建：
 
@@ -574,6 +829,9 @@ cat Include/common_with_enclaves.h | grep CHUNK  # 查看 chunk 配置
 | **Chunk 配置** | `Include/common_with_enclaves.h` |
 | **Enclave 配置** | `Enclave/Enclave.config.xml` |
 | **硬件检测** | `scripts/check_sgx2_edmm.sh` |
+| **Chunk 管理器** | `SGXDNN/chunk_manager.hpp`, `SGXDNN/chunk_manager.cpp` |
+| **加密张量** | `SGXDNN/secret_tensor.cpp` |
+| **加密实现** | `SGXDNN/Crypto.cpp` |
 
 ---
 

@@ -1,22 +1,31 @@
 #!/usr/bin/env python
 """
-Vision Transformer (ViT) Enclave Performance Profiler.
+Swin Transformer Enclave Performance Profiler.
 
-This script measures ViT layer execution in Enclave mode:
-- All layers (Conv, Linear, LayerNorm, Softmax, GELU, MatMul) run in Enclave
+This script measures Swin Transformer layer execution in Enclave mode.
 
 Usage:
-    LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6 python -m experiments.models.profile_vit_enclave
+    LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6 python -m experiments.models.profile_swin_enclave --model tiny
+
+Swin Transformer Key Features:
+- Hierarchical structure with 4 stages
+- Shifted Window Attention: W-MSA and SW-MSA alternating
+- Window size: 7x7 (LOCAL attention, memory bounded!)
+- Patch Merging for downsampling
+
+Key Insight for TEE: Window attention bounds memory to window_size^2 = 49
+tokens per window. This is much more memory-efficient than ViT's global
+attention where attention matrix scales with sequence length.
 
 Current Enclave Support Status:
+- SGXLinearBase: ✓ Supported
 - SGXConvBase: ✓ Supported
-- SGXLinearBase: ✓ Supported  
 - LayerNorm: ✓ Supported
 - Softmax: ✓ Supported
 - GELU: ✓ Supported
 - MatMul: ✓ Supported
 
-Output: experiments/data/vit_{variant}_enclave_layers.csv
+Output: experiments/data/swin_{tiny|small|base}_enclave_layers.csv
 """
 
 import sys
@@ -28,20 +37,19 @@ import numpy as np
 import argparse
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 
 sys.path.insert(0, '.')
 
 
 @dataclass
 class LayerMetrics:
-    """Data class to store layer profiling metrics (compatible with profile_vit_native.py)."""
+    """Data class to store layer profiling metrics."""
     name: str
     layer_type: str
     group: str
-    execution_mode: str = 'Enclave'  # 'Enclave' or 'CPU'
+    execution_mode: str = 'Enclave'
     
-    # Enclave timing statistics (in ms)
     enclave_time_mean: float = 0.0
     enclave_time_std: float = 0.0
     enclave_time_min: float = 0.0
@@ -49,40 +57,29 @@ class LayerMetrics:
     enclave_time_p95: float = 0.0
     enclave_time_p99: float = 0.0
     
-    # CPU timing statistics (in ms) - for comparison
     cpu_time_mean: float = 0.0
     cpu_time_std: float = 0.0
     cpu_time_min: float = 0.0
     cpu_time_max: float = 0.0
     
-    # Data sizes (in bytes)
     input_bytes: int = 0
     output_bytes: int = 0
     
-    # Input/output shapes
     input_shape: List[int] = field(default_factory=list)
     output_shape: List[int] = field(default_factory=list)
-    
-    # Dependencies (predecessor layer names)
     dependencies: List[str] = field(default_factory=list)
     
-    # Raw timing data for detailed analysis
     enclave_times: List[float] = field(default_factory=list)
     cpu_times: List[float] = field(default_factory=list)
-
-    # Enclave runtime breakdown (ms) per iteration
-    # - get/store include Enclave-side chunk paging (GetChunk/StoreChunk)
-    # - compute is pure compute time inside enclave (excluding get/store)
+    
     enclave_get_ms: List[float] = field(default_factory=list)
-    enclave_get2_ms: List[float] = field(default_factory=list)   # second input for MatMul
+    enclave_get2_ms: List[float] = field(default_factory=list)
     enclave_compute_ms: List[float] = field(default_factory=list)
     enclave_store_ms: List[float] = field(default_factory=list)
     
-    # Number of iterations used
     num_iterations: int = 0
 
     def compute_statistics(self):
-        """Compute statistics from raw timing data."""
         if self.enclave_times:
             times = np.array(self.enclave_times)
             self.enclave_time_mean = float(np.mean(times))
@@ -100,7 +97,6 @@ class LayerMetrics:
             self.cpu_time_max = float(np.max(times))
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for serialization."""
         return {
             'name': self.name,
             'type': self.layer_type,
@@ -122,7 +118,6 @@ class LayerMetrics:
             'output_shape': self.output_shape,
             'dependencies': self.dependencies,
             'num_iterations': self.num_iterations,
-            # Aggregate breakdown (computed at save-time; kept in dict for CSV/JSON)
             'xfer_edges_json': '',
             'xfer_total_mean_ms': 0.0,
             'compute_mean_ms': 0.0,
@@ -130,17 +125,13 @@ class LayerMetrics:
 
 
 def _shape_to_bytes(shape: List[int], dtype_size: int = 4) -> int:
-    """Convert shape to bytes (float32 = 4 bytes)."""
     return int(np.prod(shape)) * dtype_size
 
 
 def check_environment():
     """Check if the environment is properly set up."""
-    import subprocess
-    
     print("Checking environment...")
     
-    # Check if enclave library exists
     lib_path = "App/bin/enclave_bridge.so"
     if not os.path.exists(lib_path):
         print(f"✗ Enclave library not found at {lib_path}")
@@ -148,7 +139,6 @@ def check_environment():
         return False
     print(f"✓ Enclave library found")
     
-    # Check LD_PRELOAD
     ld_preload = os.environ.get('LD_PRELOAD', '')
     if 'libstdc++.so.6' not in ld_preload:
         print("⚠ LD_PRELOAD may need to be set for libstdc++ compatibility")
@@ -159,131 +149,313 @@ def check_environment():
     return True
 
 
-# ============================================================================
-# ViT Model Configurations
-# ============================================================================
-
-VIT_CONFIGS = {
+SWIN_CONFIG = {
     'tiny': {
-        'embed_dim': 192,
-        'num_heads': 3,
-        'num_layers': 12,
-        'mlp_ratio': 4,
+        'embed_dim': 96,
+        'depths': (2, 2, 6, 2),
+        'num_heads': (3, 6, 12, 24),
+        'window_size': 7,
+        'mlp_ratio': 4.0,
     },
     'small': {
-        'embed_dim': 384,
-        'num_heads': 6,
-        'num_layers': 12,
-        'mlp_ratio': 4,
+        'embed_dim': 96,
+        'depths': (2, 2, 18, 2),
+        'num_heads': (3, 6, 12, 24),
+        'window_size': 7,
+        'mlp_ratio': 4.0,
     },
     'base': {
-        'embed_dim': 768,
-        'num_heads': 12,
-        'num_layers': 12,
-        'mlp_ratio': 4,
-    },
-    'large': {
-        'embed_dim': 1024,
-        'num_heads': 16,
-        'num_layers': 24,
-        'mlp_ratio': 4,
+        'embed_dim': 128,
+        'depths': (2, 2, 18, 2),
+        'num_heads': (4, 8, 16, 32),
+        'window_size': 7,
+        'mlp_ratio': 4.0,
     }
 }
 
 
-class ViTEnclaveProfiler:
-    """Profiler for ViT layers in Enclave mode."""
+class SwinEnclaveProfiler:
+    """Profiler for Swin Transformer layers in Enclave mode."""
     
     def __init__(
         self, 
-        model_variant: str = 'base',
+        model_variant: str = 'tiny',
         batch_size: int = 1,
-        img_size: int = 224,
+        image_size: int = 224,
+        patch_size: int = 4,
         num_classes: int = 1000,
         num_iterations: int = 10,
         warmup_iterations: int = 3,
     ):
         self.model_variant = model_variant
         self.batch_size = batch_size
-        self.img_size = img_size
+        self.image_size = image_size
+        self.patch_size = patch_size
         self.num_classes = num_classes
         self.num_iterations = num_iterations
         self.warmup_iterations = warmup_iterations
         
-        # Get config
-        config = VIT_CONFIGS[model_variant]
+        config = SWIN_CONFIG[model_variant]
         self.embed_dim = config['embed_dim']
+        self.depths = config['depths']
         self.num_heads = config['num_heads']
-        self.num_layers = config['num_layers']
+        self.window_size = config['window_size']
         self.mlp_ratio = config['mlp_ratio']
-        self.mlp_hidden = self.embed_dim * self.mlp_ratio
-        self.head_dim = self.embed_dim // self.num_heads
         
-        # Patch embedding params
-        self.patch_size = 16
-        self.num_patches = (img_size // self.patch_size) ** 2
-        self.seq_len = self.num_patches + 1  # +1 for CLS token
-        
-        # Store metrics
         self.metrics: Dict[str, LayerMetrics] = OrderedDict()
-
-        # Reuse a single enclave for the whole profiling run.
-        # This avoids repeated SGX init/destroy churn which can eventually crash (0x1006)
-        # during long layer-by-layer profiling.
         self.reuse_single_enclave: bool = True
+        self._runtime_stats: Dict[str, Dict[str, List[float]]] = {}
+        
+        # Reset interval for memory management
+        self.ENCLAVE_RESET_INTERVAL = 3  # Reset every N blocks
     
     def profile_all(self, verbose: bool = True):
         """Profile all layers."""
         from python.enclave_interfaces import GlobalTensor
+        
         if verbose:
             print(f"\n{'='*60}")
-            print(f"Profiling ViT-{self.model_variant.capitalize()} in Enclave Mode")
+            print(f"Profiling Swin-{self.model_variant.capitalize()} in Enclave Mode")
             print(f"{'='*60}")
-            print(f"Model Config: embed_dim={self.embed_dim}, heads={self.num_heads}, "
-                  f"layers={self.num_layers}")
-            print(f"Sequence: patches={self.num_patches}, seq_len={self.seq_len}")
+            print(f"Model Config: C={self.embed_dim}, depths={self.depths}, "
+                  f"heads={self.num_heads}")
+            print(f"Window size: {self.window_size} (LOCAL attention)")
+            print(f"Image: {self.image_size}x{self.image_size}")
             print(f"Iterations: {self.num_iterations} (warmup: {self.warmup_iterations})")
+            print(f"Enclave reset interval: every {self.ENCLAVE_RESET_INTERVAL} blocks")
             print(f"{'='*60}\n")
-
-        # Reuse one enclave for the full run (recommended).
-        # We namespace every layer name by its profile name to avoid tensor-tag collisions.
+        
+        H = self.image_size // self.patch_size  # 56
+        W = self.image_size // self.patch_size  # 56
+        
         if self.reuse_single_enclave:
             try:
                 if not GlobalTensor.is_init_global_tensor:
                     GlobalTensor.init()
-
-                # Profile Conv layer (Enclave)
-                self._profile_patch_embed_enclave(verbose)
-
-                # Profile all layers in each block
-                for block_idx in range(self.num_layers):
-                    if verbose:
-                        print(f"\n--- Block {block_idx} ---")
-                    self._profile_block(block_idx, verbose)
-
-                # Profile classifier
+                
+                # Patch Embedding
                 if verbose:
-                    print(f"\n--- Classifier Head ---")
-                self._profile_classifier_enclave(verbose)
-
+                    print(f"\n--- Patch Embedding ---")
+                self._profile_conv_enclave(
+                    'patch_embed_conv',
+                    in_channels=3, out_channels=self.embed_dim,
+                    kernel_size=self.patch_size, stride=self.patch_size,
+                    image_size=self.image_size,
+                    group='PatchEmbed',
+                    verbose=verbose
+                )
+                
+                self._profile_layernorm_enclave(
+                    'patch_embed_norm',
+                    input_shape=[self.batch_size, H * W, self.embed_dim],
+                    group='PatchEmbed',
+                    verbose=verbose
+                )
+                
+                # Stages
+                dim = self.embed_dim
+                block_counter = 0
+                
+                for i_stage in range(len(self.depths)):
+                    stage_name = f'stage{i_stage}'
+                    depth = self.depths[i_stage]
+                    heads = self.num_heads[i_stage]
+                    head_dim = dim // heads
+                    
+                    num_tokens = H * W
+                    num_windows = (H // self.window_size) * (W // self.window_size)
+                    window_tokens = self.window_size ** 2
+                    
+                    if verbose:
+                        print(f"\n--- {stage_name.upper()} (H={H}, W={W}, C={dim}) ---")
+                    
+                    # Profile each block
+                    for i_block in range(depth):
+                        block_prefix = f'{stage_name}_block{i_block}'
+                        group = f'{stage_name}_block{i_block}'
+                        
+                        # Reset Enclave periodically
+                        if block_counter > 0 and block_counter % self.ENCLAVE_RESET_INTERVAL == 0:
+                            if verbose:
+                                print(f"  [Resetting Enclave (block {block_counter})...]")
+                            if GlobalTensor.is_init_global_tensor:
+                                GlobalTensor.destroy()
+                            GlobalTensor.init()
+                        block_counter += 1
+                        
+                        shift_size = 0 if (i_block % 2 == 0) else self.window_size // 2
+                        block_type = "W-MSA" if shift_size == 0 else "SW-MSA"
+                        
+                        if verbose:
+                            print(f"  Block {i_block} ({block_type}):")
+                        
+                        self._profile_swin_block_enclave(
+                            block_prefix, group, dim, heads, head_dim,
+                            num_tokens, num_windows, window_tokens,
+                            verbose
+                        )
+                    
+                    # Patch Merging
+                    if i_stage < len(self.depths) - 1:
+                        # Reset before merge
+                        if verbose:
+                            print(f"  [Resetting Enclave before merge...]")
+                        if GlobalTensor.is_init_global_tensor:
+                            GlobalTensor.destroy()
+                        GlobalTensor.init()
+                        
+                        if verbose:
+                            print(f"  Patch Merging:")
+                        
+                        self._profile_layernorm_enclave(
+                            f'{stage_name}_merge_norm',
+                            input_shape=[self.batch_size, (H // 2) * (W // 2), 4 * dim],
+                            group=f'{stage_name}_merge',
+                            verbose=verbose
+                        )
+                        
+                        self._profile_linear_enclave(
+                            f'{stage_name}_merge_reduction',
+                            input_shape=[self.batch_size, (H // 2) * (W // 2), 4 * dim],
+                            output_features=2 * dim,
+                            input_features=4 * dim,
+                            group=f'{stage_name}_merge',
+                            verbose=verbose
+                        )
+                        
+                        H = H // 2
+                        W = W // 2
+                        dim = dim * 2
+                
+                # Classification Head
+                if verbose:
+                    print(f"\n[Resetting Enclave before classifier...]")
+                if GlobalTensor.is_init_global_tensor:
+                    GlobalTensor.destroy()
+                GlobalTensor.init()
+                
+                if verbose:
+                    print(f"\n--- Classification Head ---")
+                
+                self._profile_layernorm_enclave(
+                    'final_norm',
+                    input_shape=[self.batch_size, H * W, dim],
+                    group='ClassHead',
+                    verbose=verbose
+                )
+                
+                self._profile_linear_enclave(
+                    'classifier',
+                    input_shape=[self.batch_size, dim],
+                    output_features=self.num_classes,
+                    input_features=dim,
+                    group='ClassHead',
+                    verbose=verbose
+                )
+                
                 return self.metrics
+                
             finally:
                 if GlobalTensor.is_init_global_tensor:
                     GlobalTensor.destroy()
         else:
-            # Legacy behavior: each sub-profile initializes/destroys enclave.
-            self._profile_patch_embed_enclave(verbose)
-            for block_idx in range(self.num_layers):
-                if verbose:
-                    print(f"\n--- Block {block_idx} ---")
-                self._profile_block(block_idx, verbose)
-            if verbose:
-                print(f"\n--- Classifier Head ---")
-            self._profile_classifier_enclave(verbose)
-            return self.metrics
+            # Non-reuse mode
+            pass
+        
+        return self.metrics
     
-    def _profile_patch_embed_enclave(self, verbose: bool):
-        """Profile patch embedding Conv layer in Enclave."""
+    def _profile_swin_block_enclave(
+        self, block_prefix: str, group: str, dim: int, heads: int, head_dim: int,
+        num_tokens: int, num_windows: int, window_tokens: int, verbose: bool
+    ):
+        """Profile a single Swin Transformer block in Enclave."""
+        # LayerNorm 1
+        self._profile_layernorm_enclave(
+            f'{block_prefix}_norm1',
+            input_shape=[self.batch_size, num_tokens, dim],
+            group=group, verbose=verbose
+        )
+        
+        # QKV projection
+        self._profile_linear_enclave(
+            f'{block_prefix}_attn_qkv',
+            input_shape=[self.batch_size * num_windows, window_tokens, dim],
+            output_features=dim * 3,
+            group=group, verbose=verbose
+        )
+        
+        # QK MatMul
+        self._profile_matmul_enclave(
+            f'{block_prefix}_attn_qk_matmul',
+            input_shape1=[self.batch_size * num_windows, heads, window_tokens, head_dim],
+            input_shape2=[self.batch_size * num_windows, heads, window_tokens, head_dim],
+            transpose_b=True,
+            scale=1.0 / float(np.sqrt(head_dim)),
+            group=group, verbose=verbose
+        )
+        
+        # Softmax
+        self._profile_softmax_enclave(
+            f'{block_prefix}_attn_softmax',
+            input_shape=[self.batch_size * num_windows, heads, window_tokens, window_tokens],
+            group=group, verbose=verbose
+        )
+        
+        # Attention @ V MatMul
+        self._profile_matmul_enclave(
+            f'{block_prefix}_attn_v_matmul',
+            input_shape1=[self.batch_size * num_windows, heads, window_tokens, window_tokens],
+            input_shape2=[self.batch_size * num_windows, heads, window_tokens, head_dim],
+            transpose_b=False,
+            scale=None,
+            group=group, verbose=verbose
+        )
+        
+        # Output projection
+        self._profile_linear_enclave(
+            f'{block_prefix}_attn_out_proj',
+            input_shape=[self.batch_size * num_windows, window_tokens, dim],
+            output_features=dim,
+            group=group, verbose=verbose
+        )
+        
+        # LayerNorm 2
+        self._profile_layernorm_enclave(
+            f'{block_prefix}_norm2',
+            input_shape=[self.batch_size, num_tokens, dim],
+            group=group, verbose=verbose
+        )
+        
+        # MLP FC1
+        mlp_hidden = int(dim * self.mlp_ratio)
+        self._profile_linear_enclave(
+            f'{block_prefix}_mlp_fc1',
+            input_shape=[self.batch_size, num_tokens, dim],
+            output_features=mlp_hidden,
+            group=group, verbose=verbose
+        )
+        
+        # GELU
+        self._profile_gelu_enclave(
+            f'{block_prefix}_mlp_gelu',
+            input_shape=[self.batch_size, num_tokens, mlp_hidden],
+            group=group, verbose=verbose
+        )
+        
+        # MLP FC2
+        self._profile_linear_enclave(
+            f'{block_prefix}_mlp_fc2',
+            input_shape=[self.batch_size, num_tokens, mlp_hidden],
+            output_features=dim,
+            group=group, verbose=verbose
+        )
+    
+    def _profile_conv_enclave(
+        self, name: str, in_channels: int, out_channels: int,
+        kernel_size: int, stride: int, image_size: int,
+        group: str, verbose: bool
+    ):
+        """Profile a Conv2d layer in Enclave mode."""
         import torch
         from python.enclave_interfaces import GlobalTensor
         from python.layers.sgx_conv_base import SGXConvBase
@@ -296,16 +468,13 @@ class ViTEnclaveProfiler:
             if not GlobalTensor.is_init_global_tensor:
                 GlobalTensor.init()
             
-            input_shape = [self.batch_size, 3, self.img_size, self.img_size]
-            output_shape = [self.batch_size, self.embed_dim, 
-                          self.img_size // self.patch_size, 
-                          self.img_size // self.patch_size]
+            input_shape = [self.batch_size, in_channels, image_size, image_size]
+            output_h = (image_size - kernel_size) // stride + 1
+            output_shape = [self.batch_size, out_channels, output_h, output_h]
             
             sid = 0
             layers = []
-
-            # Namespace layer names to avoid tensor-tag collisions when reusing one enclave
-            lname = lambda s: f"patch_embed::{s}"
+            lname = lambda s: f"{name}::{s}"
             
             input_layer = SecretInputLayer(
                 sid, lname("input"), input_shape,
@@ -317,12 +486,13 @@ class ViTEnclaveProfiler:
             conv_layer = SGXConvBase(
                 sid, lname("conv"),
                 ExecutionModeOptions.Enclave,
-                n_output_channel=self.embed_dim,
-                n_input_channel=3,
-                filter_hw=self.patch_size,
-                stride=self.patch_size,
+                batch_size=self.batch_size,
+                n_input_channel=in_channels,
+                n_output_channel=out_channels,
+                filter_hw=kernel_size,
+                img_hw=image_size,
+                stride=stride,
                 padding=0,
-                bias=True,
                 manually_register_prev=True,
                 manually_register_next=True
             )
@@ -337,11 +507,12 @@ class ViTEnclaveProfiler:
             output_layer.register_prev_layer(conv_layer)
             layers.append(output_layer)
             
-            secret_nn = SecretNeuralNetwork(sid, "profile_patch_embed")
+            secret_nn = SecretNeuralNetwork(sid, f"profile_{name}")
             secret_nn.set_eid(GlobalTensor.get_eid())
             secret_nn.set_layers(layers)
             
             times = []
+            self._init_runtime_bucket(name)
             total_runs = self.warmup_iterations + self.num_iterations
             
             for run_idx in range(total_runs):
@@ -352,168 +523,41 @@ class ViTEnclaveProfiler:
                 layers[0].forward()
                 layers[1].forward()
                 elapsed_ms = (time.perf_counter() - start_time) * 1000
-
-                # Fetch enclave runtime breakdown for conv layer
+                
                 stats = GlobalTensor.EnclaveInterface.get_layer_runtime_stats(layers[1].LayerName)
                 
                 if run_idx >= self.warmup_iterations:
                     times.append(elapsed_ms)
-                    # Map stats to breakdown lists
-                    # Conv is single-input: get_ms/compute_ms/store_ms
-                    self._append_runtime_stats('patch_embed', stats)
+                    self._append_runtime_stats(name, stats)
             
             metrics = LayerMetrics(
-                name='patch_embed',
+                name=name,
                 layer_type='Conv2d',
-                group='PatchEmbed',
+                group=group,
                 execution_mode='Enclave',
                 input_shape=input_shape,
                 output_shape=output_shape,
                 input_bytes=_shape_to_bytes(input_shape),
                 output_bytes=_shape_to_bytes(output_shape),
                 enclave_times=times,
-                enclave_get_ms=self._runtime_stats['patch_embed']['get_ms'],
-                enclave_get2_ms=self._runtime_stats['patch_embed']['get2_ms'],
-                enclave_compute_ms=self._runtime_stats['patch_embed']['compute_ms'],
-                enclave_store_ms=self._runtime_stats['patch_embed']['store_ms'],
                 num_iterations=self.num_iterations
             )
-            self.metrics['patch_embed'] = metrics
+            self.metrics[name] = metrics
             
             if verbose:
-                mean_time = np.mean(times)
-                std_time = np.std(times)
-                print(f"  {'patch_embed':40} {mean_time:8.3f} ± {std_time:6.3f} ms (Enclave)")
+                mean_time = np.mean(times) if times else 0
+                std_time = np.std(times) if times else 0
+                print(f"    {name:40} {mean_time:8.3f} ± {std_time:6.3f} ms (Enclave)")
             
         except Exception as e:
-            print(f"✗ Error profiling patch_embed: {e}")
-        
-        finally:
-            if (not self.reuse_single_enclave) and GlobalTensor.is_init_global_tensor:
-                GlobalTensor.destroy()
-    
-    def _profile_block(self, block_idx: int, verbose: bool):
-        """Profile a single Transformer block - ALL layers in Enclave."""
-        import torch
-        
-        prefix = f'block{block_idx}'
-        group = f'Block{block_idx}'
-        
-        torch.set_num_threads(1)
-        
-        # ===== LayerNorm 1 (Enclave) =====
-        self._profile_layernorm_enclave(
-            f'{prefix}_norm1',
-            input_shape=[self.batch_size, self.seq_len, self.embed_dim],
-            group=group,
-            verbose=verbose
-        )
-        
-        # ===== QKV Projection (Enclave) =====
-        self._profile_linear_enclave(
-            f'{prefix}_attn_qkv_proj',
-            input_shape=[self.batch_size, self.seq_len, self.embed_dim],
-            output_features=3 * self.embed_dim,
-            group=group,
-            verbose=verbose
-        )
-        
-        # ===== QK MatMul (Enclave) =====
-        # Q @ K^T with scaling 1/sqrt(head_dim)
-        self._profile_matmul_enclave(
-            f'{prefix}_attn_qk_matmul',
-            input_shape1=[self.batch_size, self.num_heads, self.seq_len, self.head_dim],  # Q
-            input_shape2=[self.batch_size, self.num_heads, self.seq_len, self.head_dim],  # K
-            transpose_b=True,
-            scale=1.0 / float(np.sqrt(self.head_dim)),
-            group=group,
-            verbose=verbose
-        )
-        
-        # ===== Softmax (Enclave) =====
-        self._profile_softmax_enclave(
-            f'{prefix}_attn_softmax',
-            input_shape=[self.batch_size, self.num_heads, self.seq_len, self.seq_len],
-            group=group,
-            verbose=verbose
-        )
-        
-        # ===== Attention @ V MatMul (Enclave) =====
-        self._profile_matmul_enclave(
-            f'{prefix}_attn_v_matmul',
-            input_shape1=[self.batch_size, self.num_heads, self.seq_len, self.seq_len],  # Attn weights
-            input_shape2=[self.batch_size, self.num_heads, self.seq_len, self.head_dim],  # V
-            transpose_b=False,
-            scale=None,
-            group=group,
-            verbose=verbose
-        )
-        
-        # ===== Output Projection (Enclave) =====
-        self._profile_linear_enclave(
-            f'{prefix}_attn_out_proj',
-            input_shape=[self.batch_size, self.seq_len, self.embed_dim],
-            output_features=self.embed_dim,
-            group=group,
-            verbose=verbose
-        )
-        
-        # ===== LayerNorm 2 (Enclave) =====
-        self._profile_layernorm_enclave(
-            f'{prefix}_norm2',
-            input_shape=[self.batch_size, self.seq_len, self.embed_dim],
-            group=group,
-            verbose=verbose
-        )
-        
-        # ===== FFN FC1 (Enclave) =====
-        self._profile_linear_enclave(
-            f'{prefix}_ffn_fc1',
-            input_shape=[self.batch_size, self.seq_len, self.embed_dim],
-            output_features=self.mlp_hidden,
-            group=group,
-            verbose=verbose
-        )
-        
-        # ===== GELU (Enclave) =====
-        self._profile_gelu_enclave(
-            f'{prefix}_ffn_gelu',
-            input_shape=[self.batch_size, self.seq_len, self.mlp_hidden],
-            group=group,
-            verbose=verbose
-        )
-        
-        # ===== FFN FC2 (Enclave) =====
-        self._profile_linear_enclave(
-            f'{prefix}_ffn_fc2',
-            input_shape=[self.batch_size, self.seq_len, self.mlp_hidden],
-            output_features=self.embed_dim,
-            group=group,
-            verbose=verbose
-        )
-    
-    def _profile_classifier_enclave(self, verbose: bool):
-        """Profile classifier head in Enclave."""
-        # Head LayerNorm (Enclave)
-        self._profile_layernorm_enclave(
-            'head_norm',
-            input_shape=[self.batch_size, self.embed_dim],
-            group='ClassHead',
-            verbose=verbose
-        )
-        
-        # Classifier (Enclave)
-        self._profile_linear_enclave(
-            'classifier',
-            input_shape=[self.batch_size, self.embed_dim],
-            output_features=self.num_classes,
-            group='ClassHead',
-            verbose=verbose
-        )
+            print(f"✗ Error profiling {name}: {e}")
+            import traceback
+            traceback.print_exc()
     
     def _profile_linear_enclave(
         self, name: str, input_shape: List[int], 
-        output_features: int, group: str, verbose: bool
+        output_features: int, group: str, verbose: bool,
+        input_features: Optional[int] = None
     ):
         """Profile a Linear layer in Enclave mode."""
         import torch
@@ -528,19 +572,17 @@ class ViTEnclaveProfiler:
             if not GlobalTensor.is_init_global_tensor:
                 GlobalTensor.init()
             
-            # Flatten input for Linear layer
             if len(input_shape) == 3:
                 flat_input_shape = [input_shape[0] * input_shape[1], input_shape[2]]
-                input_features = input_shape[2]
+                in_features = input_features if input_features else input_shape[2]
                 output_shape = [input_shape[0], input_shape[1], output_features]
             else:
                 flat_input_shape = input_shape
-                input_features = input_shape[1]
+                in_features = input_features if input_features else input_shape[-1]
                 output_shape = [input_shape[0], output_features]
             
             sid = 0
             layers = []
-
             lname = lambda s: f"{name}::{s}"
             
             input_layer = SecretInputLayer(
@@ -555,7 +597,7 @@ class ViTEnclaveProfiler:
                 ExecutionModeOptions.Enclave,
                 batch_size=flat_input_shape[0],
                 n_output_features=output_features,
-                n_input_features=input_features,
+                n_input_features=in_features,
                 manually_register_prev=True,
                 manually_register_next=True
             )
@@ -586,7 +628,7 @@ class ViTEnclaveProfiler:
                 layers[0].forward()
                 layers[1].forward()
                 elapsed_ms = (time.perf_counter() - start_time) * 1000
-
+                
                 stats = GlobalTensor.EnclaveInterface.get_layer_runtime_stats(layers[1].LayerName)
                 
                 if run_idx >= self.warmup_iterations:
@@ -603,25 +645,19 @@ class ViTEnclaveProfiler:
                 input_bytes=_shape_to_bytes(input_shape),
                 output_bytes=_shape_to_bytes(output_shape),
                 enclave_times=times,
-                enclave_get_ms=self._runtime_stats[name]['get_ms'],
-                enclave_get2_ms=self._runtime_stats[name]['get2_ms'],
-                enclave_compute_ms=self._runtime_stats[name]['compute_ms'],
-                enclave_store_ms=self._runtime_stats[name]['store_ms'],
                 num_iterations=self.num_iterations
             )
             self.metrics[name] = metrics
             
             if verbose:
-                mean_time = np.mean(times)
-                std_time = np.std(times)
-                print(f"  {name:40} {mean_time:8.3f} ± {std_time:6.3f} ms (Enclave)")
+                mean_time = np.mean(times) if times else 0
+                std_time = np.std(times) if times else 0
+                print(f"    {name:40} {mean_time:8.3f} ± {std_time:6.3f} ms (Enclave)")
             
         except Exception as e:
             print(f"✗ Error profiling {name}: {e}")
-        
-        finally:
-            if (not self.reuse_single_enclave) and GlobalTensor.is_init_global_tensor:
-                GlobalTensor.destroy()
+            import traceback
+            traceback.print_exc()
     
     def _profile_layernorm_enclave(
         self, name: str, input_shape: List[int], 
@@ -641,10 +677,8 @@ class ViTEnclaveProfiler:
                 GlobalTensor.init()
             
             output_shape = input_shape
-            
             sid = 0
             layers = []
-
             lname = lambda s: f"{name}::{s}"
             
             input_layer = SecretInputLayer(
@@ -654,7 +688,6 @@ class ViTEnclaveProfiler:
             )
             layers.append(input_layer)
             
-            # Normalized shape is the last dimension
             normalized_shape = input_shape[-1]
             
             ln_layer = SecretLayerNormLayer(
@@ -691,7 +724,7 @@ class ViTEnclaveProfiler:
                 layers[0].forward()
                 layers[1].forward()
                 elapsed_ms = (time.perf_counter() - start_time) * 1000
-
+                
                 stats = GlobalTensor.EnclaveInterface.get_layer_runtime_stats(layers[1].LayerName)
                 
                 if run_idx >= self.warmup_iterations:
@@ -708,27 +741,19 @@ class ViTEnclaveProfiler:
                 input_bytes=_shape_to_bytes(input_shape),
                 output_bytes=_shape_to_bytes(output_shape),
                 enclave_times=times,
-                enclave_get_ms=self._runtime_stats[name]['get_ms'],
-                enclave_get2_ms=self._runtime_stats[name]['get2_ms'],
-                enclave_compute_ms=self._runtime_stats[name]['compute_ms'],
-                enclave_store_ms=self._runtime_stats[name]['store_ms'],
                 num_iterations=self.num_iterations
             )
             self.metrics[name] = metrics
             
             if verbose:
-                mean_time = np.mean(times)
-                std_time = np.std(times)
-                print(f"  {name:40} {mean_time:8.3f} ± {std_time:6.3f} ms (Enclave)")
+                mean_time = np.mean(times) if times else 0
+                std_time = np.std(times) if times else 0
+                print(f"    {name:40} {mean_time:8.3f} ± {std_time:6.3f} ms (Enclave)")
             
         except Exception as e:
             print(f"✗ Error profiling {name}: {e}")
             import traceback
             traceback.print_exc()
-        
-        finally:
-            if (not self.reuse_single_enclave) and GlobalTensor.is_init_global_tensor:
-                GlobalTensor.destroy()
     
     def _profile_softmax_enclave(
         self, name: str, input_shape: List[int], 
@@ -748,10 +773,8 @@ class ViTEnclaveProfiler:
                 GlobalTensor.init()
             
             output_shape = input_shape
-            
             sid = 0
             layers = []
-
             lname = lambda s: f"{name}::{s}"
             
             input_layer = SecretInputLayer(
@@ -795,7 +818,7 @@ class ViTEnclaveProfiler:
                 layers[0].forward()
                 layers[1].forward()
                 elapsed_ms = (time.perf_counter() - start_time) * 1000
-
+                
                 stats = GlobalTensor.EnclaveInterface.get_layer_runtime_stats(layers[1].LayerName)
                 
                 if run_idx >= self.warmup_iterations:
@@ -812,27 +835,19 @@ class ViTEnclaveProfiler:
                 input_bytes=_shape_to_bytes(input_shape),
                 output_bytes=_shape_to_bytes(output_shape),
                 enclave_times=times,
-                enclave_get_ms=self._runtime_stats[name]['get_ms'],
-                enclave_get2_ms=self._runtime_stats[name]['get2_ms'],
-                enclave_compute_ms=self._runtime_stats[name]['compute_ms'],
-                enclave_store_ms=self._runtime_stats[name]['store_ms'],
                 num_iterations=self.num_iterations
             )
             self.metrics[name] = metrics
             
             if verbose:
-                mean_time = np.mean(times)
-                std_time = np.std(times)
-                print(f"  {name:40} {mean_time:8.3f} ± {std_time:6.3f} ms (Enclave)")
+                mean_time = np.mean(times) if times else 0
+                std_time = np.std(times) if times else 0
+                print(f"    {name:40} {mean_time:8.3f} ± {std_time:6.3f} ms (Enclave)")
             
         except Exception as e:
             print(f"✗ Error profiling {name}: {e}")
             import traceback
             traceback.print_exc()
-        
-        finally:
-            if (not self.reuse_single_enclave) and GlobalTensor.is_init_global_tensor:
-                GlobalTensor.destroy()
     
     def _profile_gelu_enclave(
         self, name: str, input_shape: List[int], 
@@ -852,10 +867,8 @@ class ViTEnclaveProfiler:
                 GlobalTensor.init()
             
             output_shape = input_shape
-            
             sid = 0
             layers = []
-
             lname = lambda s: f"{name}::{s}"
             
             input_layer = SecretInputLayer(
@@ -899,7 +912,7 @@ class ViTEnclaveProfiler:
                 layers[0].forward()
                 layers[1].forward()
                 elapsed_ms = (time.perf_counter() - start_time) * 1000
-
+                
                 stats = GlobalTensor.EnclaveInterface.get_layer_runtime_stats(layers[1].LayerName)
                 
                 if run_idx >= self.warmup_iterations:
@@ -916,27 +929,19 @@ class ViTEnclaveProfiler:
                 input_bytes=_shape_to_bytes(input_shape),
                 output_bytes=_shape_to_bytes(output_shape),
                 enclave_times=times,
-                enclave_get_ms=self._runtime_stats[name]['get_ms'],
-                enclave_get2_ms=self._runtime_stats[name]['get2_ms'],
-                enclave_compute_ms=self._runtime_stats[name]['compute_ms'],
-                enclave_store_ms=self._runtime_stats[name]['store_ms'],
                 num_iterations=self.num_iterations
             )
             self.metrics[name] = metrics
             
             if verbose:
-                mean_time = np.mean(times)
-                std_time = np.std(times)
-                print(f"  {name:40} {mean_time:8.3f} ± {std_time:6.3f} ms (Enclave)")
+                mean_time = np.mean(times) if times else 0
+                std_time = np.std(times) if times else 0
+                print(f"    {name:40} {mean_time:8.3f} ± {std_time:6.3f} ms (Enclave)")
             
         except Exception as e:
             print(f"✗ Error profiling {name}: {e}")
             import traceback
             traceback.print_exc()
-        
-        finally:
-            if (not self.reuse_single_enclave) and GlobalTensor.is_init_global_tensor:
-                GlobalTensor.destroy()
     
     def _profile_matmul_enclave(
         self, name: str, 
@@ -957,7 +962,6 @@ class ViTEnclaveProfiler:
             if not GlobalTensor.is_init_global_tensor:
                 GlobalTensor.init()
             
-            # Calculate output shape
             if transpose_b:
                 output_shape = input_shape1[:-2] + [input_shape1[-2], input_shape2[-2]]
             else:
@@ -965,10 +969,8 @@ class ViTEnclaveProfiler:
             
             sid = 0
             layers = []
-
             lname = lambda s: f"{name}::{s}"
             
-            # Input layer 1
             input_layer1 = SecretInputLayer(
                 sid, lname("input1"), input_shape1,
                 ExecutionModeOptions.Enclave,
@@ -976,7 +978,6 @@ class ViTEnclaveProfiler:
             )
             layers.append(input_layer1)
             
-            # Input layer 2
             input_layer2 = SecretInputLayer(
                 sid, lname("input2"), input_shape2,
                 ExecutionModeOptions.Enclave,
@@ -984,7 +985,6 @@ class ViTEnclaveProfiler:
             )
             layers.append(input_layer2)
             
-            # MatMul layer
             matmul_layer = SecretMatMulLayer(
                 sid, lname("matmul"),
                 ExecutionModeOptions.Enclave,
@@ -1024,7 +1024,7 @@ class ViTEnclaveProfiler:
                 layers[1].forward()
                 layers[2].forward()
                 elapsed_ms = (time.perf_counter() - start_time) * 1000
-
+                
                 stats = GlobalTensor.EnclaveInterface.get_layer_runtime_stats(layers[2].LayerName)
                 
                 if run_idx >= self.warmup_iterations:
@@ -1041,80 +1041,31 @@ class ViTEnclaveProfiler:
                 input_bytes=_shape_to_bytes(input_shape1) + _shape_to_bytes(input_shape2),
                 output_bytes=_shape_to_bytes(output_shape),
                 enclave_times=times,
-                enclave_get_ms=self._runtime_stats[name]['get_ms'],
-                enclave_get2_ms=self._runtime_stats[name]['get2_ms'],
-                enclave_compute_ms=self._runtime_stats[name]['compute_ms'],
-                enclave_store_ms=self._runtime_stats[name]['store_ms'],
                 num_iterations=self.num_iterations
             )
             self.metrics[name] = metrics
             
             if verbose:
-                mean_time = np.mean(times)
-                std_time = np.std(times)
-                print(f"  {name:40} {mean_time:8.3f} ± {std_time:6.3f} ms (Enclave)")
+                mean_time = np.mean(times) if times else 0
+                std_time = np.std(times) if times else 0
+                print(f"    {name:40} {mean_time:8.3f} ± {std_time:6.3f} ms (Enclave)")
             
         except Exception as e:
             print(f"✗ Error profiling {name}: {e}")
             import traceback
             traceback.print_exc()
-        
-        finally:
-            if (not self.reuse_single_enclave) and GlobalTensor.is_init_global_tensor:
-                GlobalTensor.destroy()
-    
-    def _profile_matmul_cpu(
-        self, name: str, a, b,
-        input_shape: List[int], output_shape: List[int],
-        group: str, verbose: bool
-    ):
-        """Profile matrix multiplication on CPU."""
-        import torch
-        
-        times = []
-        
-        with torch.no_grad():
-            for _ in range(self.warmup_iterations):
-                _ = torch.matmul(a, b)
-            
-            for _ in range(self.num_iterations):
-                start = time.perf_counter()
-                _ = torch.matmul(a, b)
-                end = time.perf_counter()
-                times.append((end - start) * 1000)
-        
-        metrics = LayerMetrics(
-            name=name,
-            layer_type='MatMul',
-            group=group,
-            execution_mode='CPU',
-            input_shape=input_shape,
-            output_shape=output_shape,
-            input_bytes=_shape_to_bytes(input_shape),
-            output_bytes=_shape_to_bytes(output_shape),
-            cpu_times=times,
-            num_iterations=self.num_iterations
-        )
-        self.metrics[name] = metrics
-        
-        if verbose:
-            mean_time = np.mean(times)
-            std_time = np.std(times)
-            print(f"  {name:40} {mean_time:8.3f} ± {std_time:6.3f} ms (CPU)")
     
     def save_results(self, output_dir: str = 'experiments/data'):
         """Save profiling results to CSV and JSON."""
-        # Compute statistics for all metrics before saving
         for metrics in self.metrics.values():
             metrics.compute_statistics()
         
         os.makedirs(output_dir, exist_ok=True)
         
         variant = self.model_variant
-        csv_path = os.path.join(output_dir, f'vit_{variant}_enclave_layers.csv')
-        json_path = os.path.join(output_dir, f'vit_{variant}_enclave_layers.json')
+        csv_path = os.path.join(output_dir, f'swin_{variant}_enclave_layers.csv')
+        json_path = os.path.join(output_dir, f'swin_{variant}_enclave_layers.json')
         
-        # CSV fieldnames
         fieldnames = [
             'name', 'type', 'group', 'execution_mode',
             'enclave_time_mean', 'enclave_time_std', 'enclave_time_min', 'enclave_time_max',
@@ -1131,40 +1082,32 @@ class ViTEnclaveProfiler:
             writer.writeheader()
             for metrics in self.metrics.values():
                 row = metrics.to_dict()
-                # Build edge-level xfer JSON (mean values)
-                xfer_edges_json, xfer_total_mean_ms, compute_mean_ms = self._build_xfer_edges_for_row(metrics)
-                row['xfer_edges_json'] = xfer_edges_json
-                row['xfer_total_mean_ms'] = xfer_total_mean_ms
-                row['compute_mean_ms'] = compute_mean_ms
                 row['input_shape'] = str(row['input_shape'])
                 row['output_shape'] = str(row['output_shape'])
                 row['dependencies'] = str(row['dependencies'])
                 writer.writerow(row)
         
-        # Save JSON
         with open(json_path, 'w') as f:
             json.dump({
                 'model_config': {
                     'variant': variant,
+                    'model_type': 'Swin Transformer',
                     'embed_dim': self.embed_dim,
+                    'depths': self.depths,
                     'num_heads': self.num_heads,
-                    'num_layers': self.num_layers,
+                    'window_size': self.window_size,
+                    'mlp_ratio': self.mlp_ratio,
+                    'image_size': self.image_size,
+                    'patch_size': self.patch_size,
                     'batch_size': self.batch_size,
-                    'img_size': self.img_size,
                     'num_classes': self.num_classes,
+                    'note': f'Swin uses LOCAL window attention ({self.window_size}x{self.window_size})',
                 },
                 'profiling_config': {
                     'num_iterations': self.num_iterations,
                     'warmup_iterations': self.warmup_iterations,
                 },
-                'layers': [
-                    dict(m.to_dict(), **{
-                        'xfer_edges_json': self._build_xfer_edges_for_row(m)[0],
-                        'xfer_total_mean_ms': self._build_xfer_edges_for_row(m)[1],
-                        'compute_mean_ms': self._build_xfer_edges_for_row(m)[2],
-                    })
-                    for m in self.metrics.values()
-                ],
+                'layers': [m.to_dict() for m in self.metrics.values()],
             }, f, indent=2)
         
         print(f"\nResults saved to:")
@@ -1175,48 +1118,54 @@ class ViTEnclaveProfiler:
     
     def print_summary(self):
         """Print summary statistics."""
-        # Compute statistics for all metrics before printing
         for metrics in self.metrics.values():
             metrics.compute_statistics()
         
         print(f"\n{'='*60}")
-        print(f"ViT-{self.model_variant.capitalize()} Enclave Profiling Summary")
+        print(f"Swin-{self.model_variant.capitalize()} Enclave Profiling Summary")
+        print(f"  (Uses LOCAL window attention: {self.window_size}x{self.window_size})")
         print(f"{'='*60}")
         
-        # Separate by execution mode
-        enclave_layers = {k: v for k, v in self.metrics.items() if v.execution_mode == 'Enclave'}
-        cpu_layers = {k: v for k, v in self.metrics.items() if v.execution_mode == 'CPU'}
+        total_time = sum(m.enclave_time_mean for m in self.metrics.values())
         
-        # Calculate totals
-        enclave_total = sum(m.enclave_time_mean for m in enclave_layers.values())
-        cpu_total = sum(m.cpu_time_mean for m in cpu_layers.values())
-        total_time = enclave_total + cpu_total
+        # Per stage
+        stage_times = {}
+        for metrics in self.metrics.values():
+            group = metrics.group
+            if 'stage' in group:
+                stage = group.split('_')[0]
+            elif group == 'PatchEmbed':
+                stage = 'PatchEmbed'
+            elif group == 'ClassHead':
+                stage = 'ClassHead'
+            else:
+                stage = group
+            
+            if stage not in stage_times:
+                stage_times[stage] = 0.0
+            stage_times[stage] += metrics.enclave_time_mean
         
-        print(f"\nExecution Mode Breakdown:")
-        print(f"{'Mode':<15} {'Layers':>8} {'Time (ms)':>12} {'%':>8}")
-        print(f"{'-'*45}")
-        if total_time > 0:
-            print(f"{'Enclave':<15} {len(enclave_layers):>8} {enclave_total:>12.3f} {enclave_total/total_time*100:>8.1f}%")
-            print(f"{'CPU':<15} {len(cpu_layers):>8} {cpu_total:>12.3f} {cpu_total/total_time*100:>8.1f}%")
-        else:
-            print(f"{'Enclave':<15} {len(enclave_layers):>8} {enclave_total:>12.3f} {'N/A':>8}")
-            print(f"{'CPU':<15} {len(cpu_layers):>8} {cpu_total:>12.3f} {'N/A':>8}")
-        print(f"{'-'*45}")
-        print(f"{'Total':<15} {len(self.metrics):>8} {total_time:>12.3f} {'100.0':>8}%")
+        print(f"\nPer-Stage Enclave Time:")
+        print(f"{'Stage':<20} {'Time (ms)':>12} {'%':>8}")
+        print(f"{'-'*40}")
+        for stage, time_ms in stage_times.items():
+            pct = time_ms / total_time * 100 if total_time > 0 else 0
+            print(f"{stage:<20} {time_ms:>12.3f} {pct:>8.1f}%")
+        print(f"{'-'*40}")
+        print(f"{'Total':<20} {total_time:>12.3f} {'100.0':>8}%")
         
-        # Layer type breakdown
+        # Per layer type
         type_times = {}
         type_counts = {}
         for metrics in self.metrics.values():
             ltype = metrics.layer_type
-            time_val = metrics.enclave_time_mean if metrics.execution_mode == 'Enclave' else metrics.cpu_time_mean
             if ltype not in type_times:
                 type_times[ltype] = 0.0
                 type_counts[ltype] = 0
-            type_times[ltype] += time_val
+            type_times[ltype] += metrics.enclave_time_mean
             type_counts[ltype] += 1
         
-        print(f"\nPer-Layer-Type Time:")
+        print(f"\nPer-Layer-Type Enclave Time:")
         print(f"{'Type':<15} {'Count':>8} {'Time (ms)':>12} {'%':>8}")
         print(f"{'-'*45}")
         for ltype in sorted(type_times.keys(), key=lambda x: type_times[x], reverse=True):
@@ -1225,81 +1174,32 @@ class ViTEnclaveProfiler:
             pct = time_ms / total_time * 100 if total_time > 0 else 0
             print(f"{ltype:<15} {count:>8} {time_ms:>12.3f} {pct:>8.1f}%")
         
-        # Group breakdown
-        group_times = {}
-        for metrics in self.metrics.values():
-            group = metrics.group
-            time_val = metrics.enclave_time_mean if metrics.execution_mode == 'Enclave' else metrics.cpu_time_mean
-            if group not in group_times:
-                group_times[group] = 0.0
-            group_times[group] += time_val
-        
-        print(f"\nPer-Group Time:")
-        print(f"{'Group':<20} {'Time (ms)':>12} {'%':>8}")
-        print(f"{'-'*42}")
-        for group, time_ms in group_times.items():
-            pct = time_ms / total_time * 100 if total_time > 0 else 0
-            print(f"{group:<20} {time_ms:>12.3f} {pct:>8.1f}%")
-        print(f"{'-'*42}")
-        print(f"{'Total':<20} {total_time:>12.3f} {'100.0':>8}%")
-        
         print(f"\n{'='*60}\n")
-
-    # -------------------------------------------------------------------------
-    # Runtime stats helpers (enclave get/compute/store)
-    # -------------------------------------------------------------------------
+    
     def _init_runtime_bucket(self, name: str):
-        if not hasattr(self, "_runtime_stats"):
-            self._runtime_stats = {}
         self._runtime_stats[name] = {
             "get_ms": [],
             "get2_ms": [],
             "compute_ms": [],
             "store_ms": [],
         }
-
+    
     def _append_runtime_stats(self, name: str, stats: Dict[str, float]):
-        if not hasattr(self, "_runtime_stats") or name not in self._runtime_stats:
+        if name not in self._runtime_stats:
             self._init_runtime_bucket(name)
         self._runtime_stats[name]["get_ms"].append(float(stats.get("get_ms", 0.0)))
         self._runtime_stats[name]["get2_ms"].append(float(stats.get("get2_ms", 0.0)))
         self._runtime_stats[name]["compute_ms"].append(float(stats.get("compute_ms", 0.0)))
         self._runtime_stats[name]["store_ms"].append(float(stats.get("store_ms", 0.0)))
 
-    def _build_xfer_edges_for_row(self, m: LayerMetrics):
-        """
-        Build edge-level xfer JSON (mean) for CSV/JSON.
-        This profiler uses small sub-graphs, so we use canonical internal node names:
-          - single-input: input -> op, op -> output
-          - matmul: input1 -> matmul, input2 -> matmul, matmul -> output
-        """
-        def mean(xs: List[float]) -> float:
-            return float(np.mean(xs)) if xs else 0.0
-
-        get_mean = mean(m.enclave_get_ms)
-        get2_mean = mean(m.enclave_get2_ms)
-        store_mean = mean(m.enclave_store_ms)
-        compute_mean = mean(m.enclave_compute_ms)
-
-        edges = {}
-        if m.layer_type == "MatMul":
-            edges["input1->matmul"] = {"enclave_get_ms": get_mean}
-            edges["input2->matmul"] = {"enclave_get_ms": get2_mean}
-            edges["matmul->output"] = {"enclave_store_ms": store_mean}
-            xfer_total = get_mean + get2_mean + store_mean
-        else:
-            edges["input->op"] = {"enclave_get_ms": get_mean}
-            edges["op->output"] = {"enclave_store_ms": store_mean}
-            xfer_total = get_mean + store_mean
-
-        return json.dumps(edges), xfer_total, compute_mean
-
 
 def main():
-    parser = argparse.ArgumentParser(description='Profile ViT layers in Enclave')
-    parser.add_argument('--model', type=str, default='base',
-                       choices=['tiny', 'small', 'base', 'large'],
-                       help='ViT model variant')
+    parser = argparse.ArgumentParser(description='Profile Swin Transformer layers in Enclave')
+    parser.add_argument('--model', type=str, default='tiny',
+                       choices=['tiny', 'small', 'base'],
+                       help='Swin Transformer model variant')
+    parser.add_argument('--image-size', type=int, default=224,
+                       help='Input image size')
     parser.add_argument('--iterations', type=int, default=10,
                        help='Number of measurement iterations')
     parser.add_argument('--warmup', type=int, default=3,
@@ -1311,23 +1211,18 @@ def main():
     
     args = parser.parse_args()
     
-    # Check environment
     if not check_environment():
         print("\nContinuing anyway (may fail)...\n")
     
-    profiler = ViTEnclaveProfiler(
+    profiler = SwinEnclaveProfiler(
         model_variant=args.model,
+        image_size=args.image_size,
         num_iterations=args.iterations,
         warmup_iterations=args.warmup,
     )
     
-    # Profile all layers
     profiler.profile_all(verbose=not args.quiet)
-    
-    # Print summary
     profiler.print_summary()
-    
-    # Save results
     profiler.save_results(args.output_dir)
 
 
