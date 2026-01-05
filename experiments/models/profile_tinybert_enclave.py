@@ -32,107 +32,24 @@ import json
 import numpy as np
 import argparse
 from collections import OrderedDict
-from dataclasses import dataclass, field
+
 from typing import Dict, List, Optional, Any
 
 sys.path.insert(0, '.')
 
+from experiments.models.profiler_utils import (
+    LayerMetrics,
+    calc_layer_memory_from_shapes,
+    shape_to_bytes,
+    print_memory_summary,
+    infer_layer_dependencies,
+)
 
-@dataclass
-class LayerMetrics:
-    """Data class to store layer profiling metrics."""
-    name: str
-    layer_type: str
-    group: str
-    execution_mode: str = 'Enclave'
-    
-    # Enclave timing statistics (in ms)
-    enclave_time_mean: float = 0.0
-    enclave_time_std: float = 0.0
-    enclave_time_min: float = 0.0
-    enclave_time_max: float = 0.0
-    enclave_time_p95: float = 0.0
-    enclave_time_p99: float = 0.0
-    
-    # CPU timing statistics (in ms)
-    cpu_time_mean: float = 0.0
-    cpu_time_std: float = 0.0
-    cpu_time_min: float = 0.0
-    cpu_time_max: float = 0.0
-    
-    # Data sizes (in bytes)
-    input_bytes: int = 0
-    output_bytes: int = 0
-    
-    # Input/output shapes
-    input_shape: List[int] = field(default_factory=list)
-    output_shape: List[int] = field(default_factory=list)
-    
-    # Dependencies
-    dependencies: List[str] = field(default_factory=list)
-    
-    # Raw timing data
-    enclave_times: List[float] = field(default_factory=list)
-    cpu_times: List[float] = field(default_factory=list)
-    
-    # Enclave runtime breakdown
-    enclave_get_ms: List[float] = field(default_factory=list)
-    enclave_get2_ms: List[float] = field(default_factory=list)
-    enclave_compute_ms: List[float] = field(default_factory=list)
-    enclave_store_ms: List[float] = field(default_factory=list)
-    
-    num_iterations: int = 0
-
-    def compute_statistics(self):
-        """Compute statistics from raw timing data."""
-        if self.enclave_times:
-            times = np.array(self.enclave_times)
-            self.enclave_time_mean = float(np.mean(times))
-            self.enclave_time_std = float(np.std(times))
-            self.enclave_time_min = float(np.min(times))
-            self.enclave_time_max = float(np.max(times))
-            self.enclave_time_p95 = float(np.percentile(times, 95))
-            self.enclave_time_p99 = float(np.percentile(times, 99))
-            
-        if self.cpu_times:
-            times = np.array(self.cpu_times)
-            self.cpu_time_mean = float(np.mean(times))
-            self.cpu_time_std = float(np.std(times))
-            self.cpu_time_min = float(np.min(times))
-            self.cpu_time_max = float(np.max(times))
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for serialization."""
-        return {
-            'name': self.name,
-            'type': self.layer_type,
-            'group': self.group,
-            'execution_mode': self.execution_mode,
-            'enclave_time_mean': self.enclave_time_mean,
-            'enclave_time_std': self.enclave_time_std,
-            'enclave_time_min': self.enclave_time_min,
-            'enclave_time_max': self.enclave_time_max,
-            'enclave_time_p95': self.enclave_time_p95,
-            'enclave_time_p99': self.enclave_time_p99,
-            'cpu_time_mean': self.cpu_time_mean,
-            'cpu_time_std': self.cpu_time_std,
-            'cpu_time_min': self.cpu_time_min,
-            'cpu_time_max': self.cpu_time_max,
-            'input_bytes': self.input_bytes,
-            'output_bytes': self.output_bytes,
-            'input_shape': self.input_shape,
-            'output_shape': self.output_shape,
-            'dependencies': self.dependencies,
-            'num_iterations': self.num_iterations,
-            'xfer_edges_json': '',
-            'xfer_total_mean_ms': 0.0,
-            'compute_mean_ms': 0.0,
-        }
 
 
 def _shape_to_bytes(shape: List[int], dtype_size: int = 4) -> int:
     """Convert shape to bytes (float32 = 4 bytes)."""
-    return int(np.prod(shape)) * dtype_size
+    return shape_to_bytes(shape, dtype_size)
 
 
 def check_environment():
@@ -496,6 +413,16 @@ class TinyBERTEnclaveProfiler:
                     times.append(elapsed_ms)
                     self._append_runtime_stats(name, stats)
             
+            # Calculate memory footprint
+            mem_info = calc_layer_memory_from_shapes(
+                layer_type='Linear',
+                input_shape=input_shape,
+                output_shape=output_shape,
+            )
+            
+            # Infer dependencies
+            dependencies = infer_layer_dependencies(name, list(self.metrics.keys()) + [name])
+            
             metrics = LayerMetrics(
                 name=name,
                 layer_type='Linear',
@@ -505,12 +432,23 @@ class TinyBERTEnclaveProfiler:
                 output_shape=output_shape,
                 input_bytes=_shape_to_bytes(input_shape),
                 output_bytes=_shape_to_bytes(output_shape),
+                dependencies=dependencies,
                 enclave_times=times,
                 enclave_get_ms=self._runtime_stats[name]['get_ms'],
                 enclave_get2_ms=self._runtime_stats[name]['get2_ms'],
                 enclave_compute_ms=self._runtime_stats[name]['compute_ms'],
                 enclave_store_ms=self._runtime_stats[name]['store_ms'],
-                num_iterations=self.num_iterations
+                num_iterations=self.num_iterations,
+                # Memory analysis fields
+                cpu_memory_bytes=mem_info['cpu_memory_bytes'],
+                tee_memory_bytes=mem_info['tee_memory_bytes'],
+                tee_encryption_overhead=mem_info['tee_encryption_overhead'],
+                tee_total_memory_bytes=mem_info['tee_total_memory_bytes'],
+                weight_bytes=mem_info['weight_bytes'],
+                bias_bytes=mem_info['bias_bytes'],
+                activation_bytes=mem_info['activation_bytes'],
+                num_chunks=mem_info['num_chunks'],
+                chunk_metadata_bytes=mem_info['chunk_metadata_bytes'],
             )
             self.metrics[name] = metrics
             
@@ -600,6 +538,16 @@ class TinyBERTEnclaveProfiler:
                     times.append(elapsed_ms)
                     self._append_runtime_stats(name, stats)
             
+            # Calculate memory footprint
+            mem_info = calc_layer_memory_from_shapes(
+                layer_type='LayerNorm',
+                input_shape=input_shape,
+                output_shape=output_shape,
+            )
+            
+            # Infer dependencies
+            dependencies = infer_layer_dependencies(name, list(self.metrics.keys()) + [name])
+            
             metrics = LayerMetrics(
                 name=name,
                 layer_type='LayerNorm',
@@ -609,13 +557,24 @@ class TinyBERTEnclaveProfiler:
                 output_shape=output_shape,
                 input_bytes=_shape_to_bytes(input_shape),
                 output_bytes=_shape_to_bytes(output_shape),
+                dependencies=dependencies,
                 enclave_times=times,
                 enclave_get_ms=self._runtime_stats[name]['get_ms'],
                 enclave_get2_ms=self._runtime_stats[name]['get2_ms'],
                 enclave_compute_ms=self._runtime_stats[name]['compute_ms'],
                 enclave_store_ms=self._runtime_stats[name]['store_ms'],
-                num_iterations=self.num_iterations
-            )
+                num_iterations=self.num_iterations,
+                # Memory analysis fields
+                cpu_memory_bytes=mem_info['cpu_memory_bytes'],
+                tee_memory_bytes=mem_info['tee_memory_bytes'],
+                tee_encryption_overhead=mem_info['tee_encryption_overhead'],
+                tee_total_memory_bytes=mem_info['tee_total_memory_bytes'],
+                weight_bytes=mem_info['weight_bytes'],
+                bias_bytes=mem_info['bias_bytes'],
+                activation_bytes=mem_info['activation_bytes'],
+                num_chunks=mem_info['num_chunks'],
+                chunk_metadata_bytes=mem_info['chunk_metadata_bytes'],
+        )
             self.metrics[name] = metrics
             
             if verbose:
@@ -702,6 +661,16 @@ class TinyBERTEnclaveProfiler:
                     times.append(elapsed_ms)
                     self._append_runtime_stats(name, stats)
             
+            # Calculate memory footprint
+            mem_info = calc_layer_memory_from_shapes(
+                layer_type='Softmax',
+                input_shape=input_shape,
+                output_shape=output_shape,
+            )
+            
+            # Infer dependencies
+            dependencies = infer_layer_dependencies(name, list(self.metrics.keys()) + [name])
+            
             metrics = LayerMetrics(
                 name=name,
                 layer_type='Softmax',
@@ -711,13 +680,24 @@ class TinyBERTEnclaveProfiler:
                 output_shape=output_shape,
                 input_bytes=_shape_to_bytes(input_shape),
                 output_bytes=_shape_to_bytes(output_shape),
+                dependencies=dependencies,
                 enclave_times=times,
                 enclave_get_ms=self._runtime_stats[name]['get_ms'],
                 enclave_get2_ms=self._runtime_stats[name]['get2_ms'],
                 enclave_compute_ms=self._runtime_stats[name]['compute_ms'],
                 enclave_store_ms=self._runtime_stats[name]['store_ms'],
-                num_iterations=self.num_iterations
-            )
+                num_iterations=self.num_iterations,
+                # Memory analysis fields
+                cpu_memory_bytes=mem_info['cpu_memory_bytes'],
+                tee_memory_bytes=mem_info['tee_memory_bytes'],
+                tee_encryption_overhead=mem_info['tee_encryption_overhead'],
+                tee_total_memory_bytes=mem_info['tee_total_memory_bytes'],
+                weight_bytes=mem_info['weight_bytes'],
+                bias_bytes=mem_info['bias_bytes'],
+                activation_bytes=mem_info['activation_bytes'],
+                num_chunks=mem_info['num_chunks'],
+                chunk_metadata_bytes=mem_info['chunk_metadata_bytes'],
+        )
             self.metrics[name] = metrics
             
             if verbose:
@@ -804,6 +784,16 @@ class TinyBERTEnclaveProfiler:
                     times.append(elapsed_ms)
                     self._append_runtime_stats(name, stats)
             
+            # Calculate memory footprint
+            mem_info = calc_layer_memory_from_shapes(
+                layer_type='GELU',
+                input_shape=input_shape,
+                output_shape=output_shape,
+            )
+            
+            # Infer dependencies
+            dependencies = infer_layer_dependencies(name, list(self.metrics.keys()) + [name])
+            
             metrics = LayerMetrics(
                 name=name,
                 layer_type='GELU',
@@ -813,13 +803,24 @@ class TinyBERTEnclaveProfiler:
                 output_shape=output_shape,
                 input_bytes=_shape_to_bytes(input_shape),
                 output_bytes=_shape_to_bytes(output_shape),
+                dependencies=dependencies,
                 enclave_times=times,
                 enclave_get_ms=self._runtime_stats[name]['get_ms'],
                 enclave_get2_ms=self._runtime_stats[name]['get2_ms'],
                 enclave_compute_ms=self._runtime_stats[name]['compute_ms'],
                 enclave_store_ms=self._runtime_stats[name]['store_ms'],
-                num_iterations=self.num_iterations
-            )
+                num_iterations=self.num_iterations,
+                # Memory analysis fields
+                cpu_memory_bytes=mem_info['cpu_memory_bytes'],
+                tee_memory_bytes=mem_info['tee_memory_bytes'],
+                tee_encryption_overhead=mem_info['tee_encryption_overhead'],
+                tee_total_memory_bytes=mem_info['tee_total_memory_bytes'],
+                weight_bytes=mem_info['weight_bytes'],
+                bias_bytes=mem_info['bias_bytes'],
+                activation_bytes=mem_info['activation_bytes'],
+                num_chunks=mem_info['num_chunks'],
+                chunk_metadata_bytes=mem_info['chunk_metadata_bytes'],
+        )
             self.metrics[name] = metrics
             
             if verbose:
@@ -924,6 +925,16 @@ class TinyBERTEnclaveProfiler:
                     times.append(elapsed_ms)
                     self._append_runtime_stats(name, stats)
             
+            # Calculate memory footprint
+            mem_info = calc_layer_memory_from_shapes(
+                layer_type='MatMul',
+                input_shape=input_shape1,
+                output_shape=output_shape,
+            )
+            
+            # Infer dependencies
+            dependencies = infer_layer_dependencies(name, list(self.metrics.keys()) + [name])
+            
             metrics = LayerMetrics(
                 name=name,
                 layer_type='MatMul',
@@ -933,12 +944,23 @@ class TinyBERTEnclaveProfiler:
                 output_shape=output_shape,
                 input_bytes=_shape_to_bytes(input_shape1) + _shape_to_bytes(input_shape2),
                 output_bytes=_shape_to_bytes(output_shape),
+                dependencies=dependencies,
                 enclave_times=times,
                 enclave_get_ms=self._runtime_stats[name]['get_ms'],
                 enclave_get2_ms=self._runtime_stats[name]['get2_ms'],
                 enclave_compute_ms=self._runtime_stats[name]['compute_ms'],
                 enclave_store_ms=self._runtime_stats[name]['store_ms'],
-                num_iterations=self.num_iterations
+                num_iterations=self.num_iterations,
+                # Memory analysis fields
+                cpu_memory_bytes=mem_info['cpu_memory_bytes'],
+                tee_memory_bytes=mem_info['tee_memory_bytes'],
+                tee_encryption_overhead=mem_info['tee_encryption_overhead'],
+                tee_total_memory_bytes=mem_info['tee_total_memory_bytes'],
+                weight_bytes=mem_info['weight_bytes'],
+                bias_bytes=mem_info['bias_bytes'],
+                activation_bytes=mem_info['activation_bytes'],
+                num_chunks=mem_info['num_chunks'],
+                chunk_metadata_bytes=mem_info['chunk_metadata_bytes'],
             )
             self.metrics[name] = metrics
             
@@ -975,7 +997,11 @@ class TinyBERTEnclaveProfiler:
             'input_bytes', 'output_bytes',
             'input_shape', 'output_shape',
             'dependencies', 'num_iterations',
-            'xfer_edges_json', 'xfer_total_mean_ms', 'compute_mean_ms'
+            'xfer_edges_json', 'xfer_total_mean_ms', 'compute_mean_ms',
+            # Memory analysis columns
+            'cpu_memory_bytes', 'tee_memory_bytes', 'tee_encryption_overhead',
+            'tee_total_memory_bytes', 'weight_bytes', 'bias_bytes',
+            'activation_bytes', 'num_chunks', 'chunk_metadata_bytes'
         ]
         
         with open(csv_path, 'w', newline='') as f:
@@ -1092,6 +1118,9 @@ class TinyBERTEnclaveProfiler:
         print(f"{'Total':<20} {total_time:>12.3f} {'100.0':>8}%")
         
         print(f"\n{'='*60}\n")
+        
+        # Print memory summary
+        print_memory_summary(self.metrics, "TinyBERT Enclave Memory Analysis")
     
     def _init_runtime_bucket(self, name: str):
         self._runtime_stats[name] = {

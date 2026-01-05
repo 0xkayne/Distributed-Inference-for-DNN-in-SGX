@@ -27,111 +27,22 @@ import json
 import numpy as np
 import argparse
 from collections import OrderedDict
-from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any
 
 sys.path.insert(0, '.')
 
-
-@dataclass
-class LayerMetrics:
-    """Data class to store layer profiling metrics (compatible with profile_vit_native.py)."""
-    name: str
-    layer_type: str
-    group: str
-    execution_mode: str = 'Enclave'  # 'Enclave' or 'CPU'
-    
-    # Enclave timing statistics (in ms)
-    enclave_time_mean: float = 0.0
-    enclave_time_std: float = 0.0
-    enclave_time_min: float = 0.0
-    enclave_time_max: float = 0.0
-    enclave_time_p95: float = 0.0
-    enclave_time_p99: float = 0.0
-    
-    # CPU timing statistics (in ms) - for comparison
-    cpu_time_mean: float = 0.0
-    cpu_time_std: float = 0.0
-    cpu_time_min: float = 0.0
-    cpu_time_max: float = 0.0
-    
-    # Data sizes (in bytes)
-    input_bytes: int = 0
-    output_bytes: int = 0
-    
-    # Input/output shapes
-    input_shape: List[int] = field(default_factory=list)
-    output_shape: List[int] = field(default_factory=list)
-    
-    # Dependencies (predecessor layer names)
-    dependencies: List[str] = field(default_factory=list)
-    
-    # Raw timing data for detailed analysis
-    enclave_times: List[float] = field(default_factory=list)
-    cpu_times: List[float] = field(default_factory=list)
-
-    # Enclave runtime breakdown (ms) per iteration
-    # - get/store include Enclave-side chunk paging (GetChunk/StoreChunk)
-    # - compute is pure compute time inside enclave (excluding get/store)
-    enclave_get_ms: List[float] = field(default_factory=list)
-    enclave_get2_ms: List[float] = field(default_factory=list)   # second input for MatMul
-    enclave_compute_ms: List[float] = field(default_factory=list)
-    enclave_store_ms: List[float] = field(default_factory=list)
-    
-    # Number of iterations used
-    num_iterations: int = 0
-
-    def compute_statistics(self):
-        """Compute statistics from raw timing data."""
-        if self.enclave_times:
-            times = np.array(self.enclave_times)
-            self.enclave_time_mean = float(np.mean(times))
-            self.enclave_time_std = float(np.std(times))
-            self.enclave_time_min = float(np.min(times))
-            self.enclave_time_max = float(np.max(times))
-            self.enclave_time_p95 = float(np.percentile(times, 95))
-            self.enclave_time_p99 = float(np.percentile(times, 99))
-            
-        if self.cpu_times:
-            times = np.array(self.cpu_times)
-            self.cpu_time_mean = float(np.mean(times))
-            self.cpu_time_std = float(np.std(times))
-            self.cpu_time_min = float(np.min(times))
-            self.cpu_time_max = float(np.max(times))
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for serialization."""
-        return {
-            'name': self.name,
-            'type': self.layer_type,
-            'group': self.group,
-            'execution_mode': self.execution_mode,
-            'enclave_time_mean': self.enclave_time_mean,
-            'enclave_time_std': self.enclave_time_std,
-            'enclave_time_min': self.enclave_time_min,
-            'enclave_time_max': self.enclave_time_max,
-            'enclave_time_p95': self.enclave_time_p95,
-            'enclave_time_p99': self.enclave_time_p99,
-            'cpu_time_mean': self.cpu_time_mean,
-            'cpu_time_std': self.cpu_time_std,
-            'cpu_time_min': self.cpu_time_min,
-            'cpu_time_max': self.cpu_time_max,
-            'input_bytes': self.input_bytes,
-            'output_bytes': self.output_bytes,
-            'input_shape': self.input_shape,
-            'output_shape': self.output_shape,
-            'dependencies': self.dependencies,
-            'num_iterations': self.num_iterations,
-            # Aggregate breakdown (computed at save-time; kept in dict for CSV/JSON)
-            'xfer_edges_json': '',
-            'xfer_total_mean_ms': 0.0,
-            'compute_mean_ms': 0.0,
-        }
+from experiments.models.profiler_utils import (
+    LayerMetrics,
+    calc_layer_memory_from_shapes,
+    shape_to_bytes,
+    print_memory_summary,
+    infer_layer_dependencies,
+)
 
 
 def _shape_to_bytes(shape: List[int], dtype_size: int = 4) -> int:
     """Convert shape to bytes (float32 = 4 bytes)."""
-    return int(np.prod(shape)) * dtype_size
+    return shape_to_bytes(shape, dtype_size)
 
 
 def check_environment():
@@ -362,6 +273,17 @@ class ViTEnclaveProfiler:
                     # Conv is single-input: get_ms/compute_ms/store_ms
                     self._append_runtime_stats('patch_embed', stats)
             
+            # Calculate memory footprint
+            mem_info = calc_layer_memory_from_shapes(
+                layer_type='Conv2d',
+                input_shape=input_shape,
+                output_shape=output_shape,
+                kernel_size=self.patch_size,
+            )
+            
+            # Infer dependencies
+            dependencies = infer_layer_dependencies('patch_embed', list(self.metrics.keys()) + ['patch_embed'])
+            
             metrics = LayerMetrics(
                 name='patch_embed',
                 layer_type='Conv2d',
@@ -371,12 +293,23 @@ class ViTEnclaveProfiler:
                 output_shape=output_shape,
                 input_bytes=_shape_to_bytes(input_shape),
                 output_bytes=_shape_to_bytes(output_shape),
+                dependencies=dependencies,
                 enclave_times=times,
                 enclave_get_ms=self._runtime_stats['patch_embed']['get_ms'],
                 enclave_get2_ms=self._runtime_stats['patch_embed']['get2_ms'],
                 enclave_compute_ms=self._runtime_stats['patch_embed']['compute_ms'],
                 enclave_store_ms=self._runtime_stats['patch_embed']['store_ms'],
-                num_iterations=self.num_iterations
+                num_iterations=self.num_iterations,
+                # Memory analysis fields
+                cpu_memory_bytes=mem_info['cpu_memory_bytes'],
+                tee_memory_bytes=mem_info['tee_memory_bytes'],
+                tee_encryption_overhead=mem_info['tee_encryption_overhead'],
+                tee_total_memory_bytes=mem_info['tee_total_memory_bytes'],
+                weight_bytes=mem_info['weight_bytes'],
+                bias_bytes=mem_info['bias_bytes'],
+                activation_bytes=mem_info['activation_bytes'],
+                num_chunks=mem_info['num_chunks'],
+                chunk_metadata_bytes=mem_info['chunk_metadata_bytes'],
             )
             self.metrics['patch_embed'] = metrics
             
@@ -593,6 +526,16 @@ class ViTEnclaveProfiler:
                     times.append(elapsed_ms)
                     self._append_runtime_stats(name, stats)
             
+            # Calculate memory footprint
+            mem_info = calc_layer_memory_from_shapes(
+                layer_type='Linear',
+                input_shape=input_shape,
+                output_shape=output_shape,
+            )
+            
+            # Infer dependencies
+            dependencies = infer_layer_dependencies(name, list(self.metrics.keys()) + [name])
+            
             metrics = LayerMetrics(
                 name=name,
                 layer_type='Linear',
@@ -602,12 +545,23 @@ class ViTEnclaveProfiler:
                 output_shape=output_shape,
                 input_bytes=_shape_to_bytes(input_shape),
                 output_bytes=_shape_to_bytes(output_shape),
+                dependencies=dependencies,
                 enclave_times=times,
                 enclave_get_ms=self._runtime_stats[name]['get_ms'],
                 enclave_get2_ms=self._runtime_stats[name]['get2_ms'],
                 enclave_compute_ms=self._runtime_stats[name]['compute_ms'],
                 enclave_store_ms=self._runtime_stats[name]['store_ms'],
-                num_iterations=self.num_iterations
+                num_iterations=self.num_iterations,
+                # Memory analysis fields
+                cpu_memory_bytes=mem_info['cpu_memory_bytes'],
+                tee_memory_bytes=mem_info['tee_memory_bytes'],
+                tee_encryption_overhead=mem_info['tee_encryption_overhead'],
+                tee_total_memory_bytes=mem_info['tee_total_memory_bytes'],
+                weight_bytes=mem_info['weight_bytes'],
+                bias_bytes=mem_info['bias_bytes'],
+                activation_bytes=mem_info['activation_bytes'],
+                num_chunks=mem_info['num_chunks'],
+                chunk_metadata_bytes=mem_info['chunk_metadata_bytes'],
             )
             self.metrics[name] = metrics
             
@@ -698,6 +652,16 @@ class ViTEnclaveProfiler:
                     times.append(elapsed_ms)
                     self._append_runtime_stats(name, stats)
             
+            # Calculate memory footprint
+            mem_info = calc_layer_memory_from_shapes(
+                layer_type='LayerNorm',
+                input_shape=input_shape,
+                output_shape=output_shape,
+            )
+            
+            # Infer dependencies
+            dependencies = infer_layer_dependencies(name, list(self.metrics.keys()) + [name])
+            
             metrics = LayerMetrics(
                 name=name,
                 layer_type='LayerNorm',
@@ -707,12 +671,23 @@ class ViTEnclaveProfiler:
                 output_shape=output_shape,
                 input_bytes=_shape_to_bytes(input_shape),
                 output_bytes=_shape_to_bytes(output_shape),
+                dependencies=dependencies,
                 enclave_times=times,
                 enclave_get_ms=self._runtime_stats[name]['get_ms'],
                 enclave_get2_ms=self._runtime_stats[name]['get2_ms'],
                 enclave_compute_ms=self._runtime_stats[name]['compute_ms'],
                 enclave_store_ms=self._runtime_stats[name]['store_ms'],
-                num_iterations=self.num_iterations
+                num_iterations=self.num_iterations,
+                # Memory analysis fields
+                cpu_memory_bytes=mem_info['cpu_memory_bytes'],
+                tee_memory_bytes=mem_info['tee_memory_bytes'],
+                tee_encryption_overhead=mem_info['tee_encryption_overhead'],
+                tee_total_memory_bytes=mem_info['tee_total_memory_bytes'],
+                weight_bytes=mem_info['weight_bytes'],
+                bias_bytes=mem_info['bias_bytes'],
+                activation_bytes=mem_info['activation_bytes'],
+                num_chunks=mem_info['num_chunks'],
+                chunk_metadata_bytes=mem_info['chunk_metadata_bytes'],
             )
             self.metrics[name] = metrics
             
@@ -802,6 +777,16 @@ class ViTEnclaveProfiler:
                     times.append(elapsed_ms)
                     self._append_runtime_stats(name, stats)
             
+            # Calculate memory footprint (Softmax has no weights)
+            mem_info = calc_layer_memory_from_shapes(
+                layer_type='Softmax',
+                input_shape=input_shape,
+                output_shape=output_shape,
+            )
+            
+            # Infer dependencies
+            dependencies = infer_layer_dependencies(name, list(self.metrics.keys()) + [name])
+            
             metrics = LayerMetrics(
                 name=name,
                 layer_type='Softmax',
@@ -811,12 +796,23 @@ class ViTEnclaveProfiler:
                 output_shape=output_shape,
                 input_bytes=_shape_to_bytes(input_shape),
                 output_bytes=_shape_to_bytes(output_shape),
+                dependencies=dependencies,
                 enclave_times=times,
                 enclave_get_ms=self._runtime_stats[name]['get_ms'],
                 enclave_get2_ms=self._runtime_stats[name]['get2_ms'],
                 enclave_compute_ms=self._runtime_stats[name]['compute_ms'],
                 enclave_store_ms=self._runtime_stats[name]['store_ms'],
-                num_iterations=self.num_iterations
+                num_iterations=self.num_iterations,
+                # Memory analysis fields
+                cpu_memory_bytes=mem_info['cpu_memory_bytes'],
+                tee_memory_bytes=mem_info['tee_memory_bytes'],
+                tee_encryption_overhead=mem_info['tee_encryption_overhead'],
+                tee_total_memory_bytes=mem_info['tee_total_memory_bytes'],
+                weight_bytes=mem_info['weight_bytes'],
+                bias_bytes=mem_info['bias_bytes'],
+                activation_bytes=mem_info['activation_bytes'],
+                num_chunks=mem_info['num_chunks'],
+                chunk_metadata_bytes=mem_info['chunk_metadata_bytes'],
             )
             self.metrics[name] = metrics
             
@@ -906,6 +902,16 @@ class ViTEnclaveProfiler:
                     times.append(elapsed_ms)
                     self._append_runtime_stats(name, stats)
             
+            # Calculate memory footprint (GELU has no weights)
+            mem_info = calc_layer_memory_from_shapes(
+                layer_type='GELU',
+                input_shape=input_shape,
+                output_shape=output_shape,
+            )
+            
+            # Infer dependencies
+            dependencies = infer_layer_dependencies(name, list(self.metrics.keys()) + [name])
+            
             metrics = LayerMetrics(
                 name=name,
                 layer_type='GELU',
@@ -915,12 +921,23 @@ class ViTEnclaveProfiler:
                 output_shape=output_shape,
                 input_bytes=_shape_to_bytes(input_shape),
                 output_bytes=_shape_to_bytes(output_shape),
+                dependencies=dependencies,
                 enclave_times=times,
                 enclave_get_ms=self._runtime_stats[name]['get_ms'],
                 enclave_get2_ms=self._runtime_stats[name]['get2_ms'],
                 enclave_compute_ms=self._runtime_stats[name]['compute_ms'],
                 enclave_store_ms=self._runtime_stats[name]['store_ms'],
-                num_iterations=self.num_iterations
+                num_iterations=self.num_iterations,
+                # Memory analysis fields
+                cpu_memory_bytes=mem_info['cpu_memory_bytes'],
+                tee_memory_bytes=mem_info['tee_memory_bytes'],
+                tee_encryption_overhead=mem_info['tee_encryption_overhead'],
+                tee_total_memory_bytes=mem_info['tee_total_memory_bytes'],
+                weight_bytes=mem_info['weight_bytes'],
+                bias_bytes=mem_info['bias_bytes'],
+                activation_bytes=mem_info['activation_bytes'],
+                num_chunks=mem_info['num_chunks'],
+                chunk_metadata_bytes=mem_info['chunk_metadata_bytes'],
             )
             self.metrics[name] = metrics
             
@@ -1031,6 +1048,23 @@ class ViTEnclaveProfiler:
                     times.append(elapsed_ms)
                     self._append_runtime_stats(name, stats)
             
+            # Calculate memory footprint (MatMul has no weights)
+            # Use combined input shape for memory calculation
+            combined_input_shape = input_shape1  # Primary input shape for memory calc
+            mem_info = calc_layer_memory_from_shapes(
+                layer_type='MatMul',
+                input_shape=combined_input_shape,
+                output_shape=output_shape,
+            )
+            # Add second input to activation bytes
+            mem_info['activation_bytes'] += _shape_to_bytes(input_shape2)
+            mem_info['cpu_memory_bytes'] += _shape_to_bytes(input_shape2)
+            mem_info['tee_memory_bytes'] += _shape_to_bytes(input_shape2)
+            mem_info['tee_total_memory_bytes'] += _shape_to_bytes(input_shape2)
+            
+            # Infer dependencies
+            dependencies = infer_layer_dependencies(name, list(self.metrics.keys()) + [name])
+            
             metrics = LayerMetrics(
                 name=name,
                 layer_type='MatMul',
@@ -1040,12 +1074,23 @@ class ViTEnclaveProfiler:
                 output_shape=output_shape,
                 input_bytes=_shape_to_bytes(input_shape1) + _shape_to_bytes(input_shape2),
                 output_bytes=_shape_to_bytes(output_shape),
+                dependencies=dependencies,
                 enclave_times=times,
                 enclave_get_ms=self._runtime_stats[name]['get_ms'],
                 enclave_get2_ms=self._runtime_stats[name]['get2_ms'],
                 enclave_compute_ms=self._runtime_stats[name]['compute_ms'],
                 enclave_store_ms=self._runtime_stats[name]['store_ms'],
-                num_iterations=self.num_iterations
+                num_iterations=self.num_iterations,
+                # Memory analysis fields
+                cpu_memory_bytes=mem_info['cpu_memory_bytes'],
+                tee_memory_bytes=mem_info['tee_memory_bytes'],
+                tee_encryption_overhead=mem_info['tee_encryption_overhead'],
+                tee_total_memory_bytes=mem_info['tee_total_memory_bytes'],
+                weight_bytes=mem_info['weight_bytes'],
+                bias_bytes=mem_info['bias_bytes'],
+                activation_bytes=mem_info['activation_bytes'],
+                num_chunks=mem_info['num_chunks'],
+                chunk_metadata_bytes=mem_info['chunk_metadata_bytes'],
             )
             self.metrics[name] = metrics
             
@@ -1083,6 +1128,16 @@ class ViTEnclaveProfiler:
                 end = time.perf_counter()
                 times.append((end - start) * 1000)
         
+        # Calculate memory footprint (MatMul has no weights)
+        mem_info = calc_layer_memory_from_shapes(
+            layer_type='MatMul',
+            input_shape=input_shape,
+            output_shape=output_shape,
+        )
+        
+        # Infer dependencies
+        dependencies = infer_layer_dependencies(name, list(self.metrics.keys()) + [name])
+        
         metrics = LayerMetrics(
             name=name,
             layer_type='MatMul',
@@ -1092,8 +1147,19 @@ class ViTEnclaveProfiler:
             output_shape=output_shape,
             input_bytes=_shape_to_bytes(input_shape),
             output_bytes=_shape_to_bytes(output_shape),
+            dependencies=dependencies,
             cpu_times=times,
-            num_iterations=self.num_iterations
+            num_iterations=self.num_iterations,
+            # Memory analysis fields
+            cpu_memory_bytes=mem_info['cpu_memory_bytes'],
+            tee_memory_bytes=mem_info['tee_memory_bytes'],
+            tee_encryption_overhead=mem_info['tee_encryption_overhead'],
+            tee_total_memory_bytes=mem_info['tee_total_memory_bytes'],
+            weight_bytes=mem_info['weight_bytes'],
+            bias_bytes=mem_info['bias_bytes'],
+            activation_bytes=mem_info['activation_bytes'],
+            num_chunks=mem_info['num_chunks'],
+            chunk_metadata_bytes=mem_info['chunk_metadata_bytes'],
         )
         self.metrics[name] = metrics
         
@@ -1114,7 +1180,7 @@ class ViTEnclaveProfiler:
         csv_path = os.path.join(output_dir, f'vit_{variant}_enclave_layers.csv')
         json_path = os.path.join(output_dir, f'vit_{variant}_enclave_layers.json')
         
-        # CSV fieldnames
+        # CSV fieldnames (with memory analysis columns)
         fieldnames = [
             'name', 'type', 'group', 'execution_mode',
             'enclave_time_mean', 'enclave_time_std', 'enclave_time_min', 'enclave_time_max',
@@ -1123,7 +1189,11 @@ class ViTEnclaveProfiler:
             'input_bytes', 'output_bytes',
             'input_shape', 'output_shape',
             'dependencies', 'num_iterations',
-            'xfer_edges_json', 'xfer_total_mean_ms', 'compute_mean_ms'
+            'xfer_edges_json', 'xfer_total_mean_ms', 'compute_mean_ms',
+            # Memory analysis columns
+            'cpu_memory_bytes', 'tee_memory_bytes', 'tee_encryption_overhead',
+            'tee_total_memory_bytes', 'weight_bytes', 'bias_bytes',
+            'activation_bytes', 'num_chunks', 'chunk_metadata_bytes'
         ]
         
         with open(csv_path, 'w', newline='') as f:
@@ -1244,6 +1314,9 @@ class ViTEnclaveProfiler:
         print(f"{'Total':<20} {total_time:>12.3f} {'100.0':>8}%")
         
         print(f"\n{'='*60}\n")
+        
+        # Print memory summary
+        print_memory_summary(self.metrics, f"ViT-{self.model_variant.capitalize()} Enclave Memory Analysis")
 
     # -------------------------------------------------------------------------
     # Runtime stats helpers (enclave get/compute/store)

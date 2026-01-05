@@ -36,92 +36,19 @@ import json
 import numpy as np
 import argparse
 from collections import OrderedDict
-from dataclasses import dataclass, field
+
 from typing import Dict, List, Optional, Any, Tuple
 
 sys.path.insert(0, '.')
 
+from experiments.models.profiler_utils import (
+    LayerMetrics,
+    calc_layer_memory_from_shapes,
+    shape_to_bytes,
+    print_memory_summary,
+    infer_layer_dependencies,
+)
 
-@dataclass
-class LayerMetrics:
-    """Data class to store layer profiling metrics."""
-    name: str
-    layer_type: str
-    group: str
-    execution_mode: str = 'Enclave'
-    
-    enclave_time_mean: float = 0.0
-    enclave_time_std: float = 0.0
-    enclave_time_min: float = 0.0
-    enclave_time_max: float = 0.0
-    enclave_time_p95: float = 0.0
-    enclave_time_p99: float = 0.0
-    
-    cpu_time_mean: float = 0.0
-    cpu_time_std: float = 0.0
-    cpu_time_min: float = 0.0
-    cpu_time_max: float = 0.0
-    
-    input_bytes: int = 0
-    output_bytes: int = 0
-    
-    input_shape: List[int] = field(default_factory=list)
-    output_shape: List[int] = field(default_factory=list)
-    dependencies: List[str] = field(default_factory=list)
-    
-    enclave_times: List[float] = field(default_factory=list)
-    cpu_times: List[float] = field(default_factory=list)
-    
-    enclave_get_ms: List[float] = field(default_factory=list)
-    enclave_get2_ms: List[float] = field(default_factory=list)
-    enclave_compute_ms: List[float] = field(default_factory=list)
-    enclave_store_ms: List[float] = field(default_factory=list)
-    
-    num_iterations: int = 0
-
-    def compute_statistics(self):
-        if self.enclave_times:
-            times = np.array(self.enclave_times)
-            self.enclave_time_mean = float(np.mean(times))
-            self.enclave_time_std = float(np.std(times))
-            self.enclave_time_min = float(np.min(times))
-            self.enclave_time_max = float(np.max(times))
-            self.enclave_time_p95 = float(np.percentile(times, 95))
-            self.enclave_time_p99 = float(np.percentile(times, 99))
-            
-        if self.cpu_times:
-            times = np.array(self.cpu_times)
-            self.cpu_time_mean = float(np.mean(times))
-            self.cpu_time_std = float(np.std(times))
-            self.cpu_time_min = float(np.min(times))
-            self.cpu_time_max = float(np.max(times))
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            'name': self.name,
-            'type': self.layer_type,
-            'group': self.group,
-            'execution_mode': self.execution_mode,
-            'enclave_time_mean': self.enclave_time_mean,
-            'enclave_time_std': self.enclave_time_std,
-            'enclave_time_min': self.enclave_time_min,
-            'enclave_time_max': self.enclave_time_max,
-            'enclave_time_p95': self.enclave_time_p95,
-            'enclave_time_p99': self.enclave_time_p99,
-            'cpu_time_mean': self.cpu_time_mean,
-            'cpu_time_std': self.cpu_time_std,
-            'cpu_time_min': self.cpu_time_min,
-            'cpu_time_max': self.cpu_time_max,
-            'input_bytes': self.input_bytes,
-            'output_bytes': self.output_bytes,
-            'input_shape': self.input_shape,
-            'output_shape': self.output_shape,
-            'dependencies': self.dependencies,
-            'num_iterations': self.num_iterations,
-            'xfer_edges_json': '',
-            'xfer_total_mean_ms': 0.0,
-            'compute_mean_ms': 0.0,
-        }
 
 
 def _shape_to_bytes(shape: List[int], dtype_size: int = 4) -> int:
@@ -194,25 +121,25 @@ class SwinEnclaveProfiler:
         self.num_classes = num_classes
         self.num_iterations = num_iterations
         self.warmup_iterations = warmup_iterations
-        
+            
         config = SWIN_CONFIG[model_variant]
         self.embed_dim = config['embed_dim']
         self.depths = config['depths']
         self.num_heads = config['num_heads']
         self.window_size = config['window_size']
         self.mlp_ratio = config['mlp_ratio']
-        
+            
         self.metrics: Dict[str, LayerMetrics] = OrderedDict()
         self.reuse_single_enclave: bool = True
         self._runtime_stats: Dict[str, Dict[str, List[float]]] = {}
-        
+            
         # Reset interval for memory management
         self.ENCLAVE_RESET_INTERVAL = 3  # Reset every N blocks
     
     def profile_all(self, verbose: bool = True):
         """Profile all layers."""
         from python.enclave_interfaces import GlobalTensor
-        
+            
         if verbose:
             print(f"\n{'='*60}")
             print(f"Profiling Swin-{self.model_variant.capitalize()} in Enclave Mode")
@@ -224,10 +151,10 @@ class SwinEnclaveProfiler:
             print(f"Iterations: {self.num_iterations} (warmup: {self.warmup_iterations})")
             print(f"Enclave reset interval: every {self.ENCLAVE_RESET_INTERVAL} blocks")
             print(f"{'='*60}\n")
-        
+            
         H = self.image_size // self.patch_size  # 56
         W = self.image_size // self.patch_size  # 56
-        
+            
         if self.reuse_single_enclave:
             try:
                 if not GlobalTensor.is_init_global_tensor:
@@ -361,7 +288,7 @@ class SwinEnclaveProfiler:
         else:
             # Non-reuse mode
             pass
-        
+            
         return self.metrics
     
     def _profile_swin_block_enclave(
@@ -374,16 +301,16 @@ class SwinEnclaveProfiler:
             f'{block_prefix}_norm1',
             input_shape=[self.batch_size, num_tokens, dim],
             group=group, verbose=verbose
-        )
-        
+            )
+            
         # QKV projection
         self._profile_linear_enclave(
             f'{block_prefix}_attn_qkv',
             input_shape=[self.batch_size * num_windows, window_tokens, dim],
             output_features=dim * 3,
             group=group, verbose=verbose
-        )
-        
+            )
+            
         # QK MatMul
         self._profile_matmul_enclave(
             f'{block_prefix}_attn_qk_matmul',
@@ -392,15 +319,15 @@ class SwinEnclaveProfiler:
             transpose_b=True,
             scale=1.0 / float(np.sqrt(head_dim)),
             group=group, verbose=verbose
-        )
-        
+            )
+            
         # Softmax
         self._profile_softmax_enclave(
             f'{block_prefix}_attn_softmax',
             input_shape=[self.batch_size * num_windows, heads, window_tokens, window_tokens],
             group=group, verbose=verbose
-        )
-        
+            )
+            
         # Attention @ V MatMul
         self._profile_matmul_enclave(
             f'{block_prefix}_attn_v_matmul',
@@ -409,23 +336,23 @@ class SwinEnclaveProfiler:
             transpose_b=False,
             scale=None,
             group=group, verbose=verbose
-        )
-        
+            )
+            
         # Output projection
         self._profile_linear_enclave(
             f'{block_prefix}_attn_out_proj',
             input_shape=[self.batch_size * num_windows, window_tokens, dim],
             output_features=dim,
             group=group, verbose=verbose
-        )
-        
+            )
+            
         # LayerNorm 2
         self._profile_layernorm_enclave(
             f'{block_prefix}_norm2',
             input_shape=[self.batch_size, num_tokens, dim],
             group=group, verbose=verbose
-        )
-        
+            )
+            
         # MLP FC1
         mlp_hidden = int(dim * self.mlp_ratio)
         self._profile_linear_enclave(
@@ -433,22 +360,22 @@ class SwinEnclaveProfiler:
             input_shape=[self.batch_size, num_tokens, dim],
             output_features=mlp_hidden,
             group=group, verbose=verbose
-        )
-        
+            )
+            
         # GELU
         self._profile_gelu_enclave(
             f'{block_prefix}_mlp_gelu',
             input_shape=[self.batch_size, num_tokens, mlp_hidden],
             group=group, verbose=verbose
-        )
-        
+            )
+            
         # MLP FC2
         self._profile_linear_enclave(
             f'{block_prefix}_mlp_fc2',
             input_shape=[self.batch_size, num_tokens, mlp_hidden],
             output_features=dim,
             group=group, verbose=verbose
-        )
+            )
     
     def _profile_conv_enclave(
         self, name: str, in_channels: int, out_channels: int,
@@ -463,7 +390,7 @@ class SwinEnclaveProfiler:
         from python.layers.output import SecretOutputLayer
         from python.sgx_net import SecretNeuralNetwork
         from python.utils.basic_utils import ExecutionModeOptions
-        
+            
         try:
             if not GlobalTensor.is_init_global_tensor:
                 GlobalTensor.init()
@@ -530,6 +457,16 @@ class SwinEnclaveProfiler:
                     times.append(elapsed_ms)
                     self._append_runtime_stats(name, stats)
             
+            # Calculate memory footprint
+            mem_info = calc_layer_memory_from_shapes(
+                layer_type='Conv2d',
+                input_shape=input_shape,
+                output_shape=output_shape,
+            )
+            
+            # Infer dependencies
+            dependencies = infer_layer_dependencies(name, list(self.metrics.keys()) + [name])
+            
             metrics = LayerMetrics(
                 name=name,
                 layer_type='Conv2d',
@@ -539,8 +476,19 @@ class SwinEnclaveProfiler:
                 output_shape=output_shape,
                 input_bytes=_shape_to_bytes(input_shape),
                 output_bytes=_shape_to_bytes(output_shape),
+                dependencies=dependencies,
                 enclave_times=times,
-                num_iterations=self.num_iterations
+                num_iterations=self.num_iterations,
+                # Memory analysis fields
+                cpu_memory_bytes=mem_info['cpu_memory_bytes'],
+                tee_memory_bytes=mem_info['tee_memory_bytes'],
+                tee_encryption_overhead=mem_info['tee_encryption_overhead'],
+                tee_total_memory_bytes=mem_info['tee_total_memory_bytes'],
+                weight_bytes=mem_info['weight_bytes'],
+                bias_bytes=mem_info['bias_bytes'],
+                activation_bytes=mem_info['activation_bytes'],
+                num_chunks=mem_info['num_chunks'],
+                chunk_metadata_bytes=mem_info['chunk_metadata_bytes'],
             )
             self.metrics[name] = metrics
             
@@ -567,7 +515,7 @@ class SwinEnclaveProfiler:
         from python.layers.output import SecretOutputLayer
         from python.sgx_net import SecretNeuralNetwork
         from python.utils.basic_utils import ExecutionModeOptions
-        
+            
         try:
             if not GlobalTensor.is_init_global_tensor:
                 GlobalTensor.init()
@@ -635,6 +583,16 @@ class SwinEnclaveProfiler:
                     times.append(elapsed_ms)
                     self._append_runtime_stats(name, stats)
             
+            # Calculate memory footprint
+            mem_info = calc_layer_memory_from_shapes(
+                layer_type='Linear',
+                input_shape=input_shape,
+                output_shape=output_shape,
+            )
+            
+            # Infer dependencies
+            dependencies = infer_layer_dependencies(name, list(self.metrics.keys()) + [name])
+            
             metrics = LayerMetrics(
                 name=name,
                 layer_type='Linear',
@@ -644,8 +602,19 @@ class SwinEnclaveProfiler:
                 output_shape=output_shape,
                 input_bytes=_shape_to_bytes(input_shape),
                 output_bytes=_shape_to_bytes(output_shape),
+                dependencies=dependencies,
                 enclave_times=times,
-                num_iterations=self.num_iterations
+                num_iterations=self.num_iterations,
+                # Memory analysis fields
+                cpu_memory_bytes=mem_info['cpu_memory_bytes'],
+                tee_memory_bytes=mem_info['tee_memory_bytes'],
+                tee_encryption_overhead=mem_info['tee_encryption_overhead'],
+                tee_total_memory_bytes=mem_info['tee_total_memory_bytes'],
+                weight_bytes=mem_info['weight_bytes'],
+                bias_bytes=mem_info['bias_bytes'],
+                activation_bytes=mem_info['activation_bytes'],
+                num_chunks=mem_info['num_chunks'],
+                chunk_metadata_bytes=mem_info['chunk_metadata_bytes'],
             )
             self.metrics[name] = metrics
             
@@ -671,7 +640,7 @@ class SwinEnclaveProfiler:
         from python.layers.output import SecretOutputLayer
         from python.sgx_net import SecretNeuralNetwork
         from python.utils.basic_utils import ExecutionModeOptions
-        
+            
         try:
             if not GlobalTensor.is_init_global_tensor:
                 GlobalTensor.init()
@@ -731,6 +700,16 @@ class SwinEnclaveProfiler:
                     times.append(elapsed_ms)
                     self._append_runtime_stats(name, stats)
             
+            # Calculate memory footprint
+            mem_info = calc_layer_memory_from_shapes(
+                layer_type='LayerNorm',
+                input_shape=input_shape,
+                output_shape=output_shape,
+            )
+            
+            # Infer dependencies
+            dependencies = infer_layer_dependencies(name, list(self.metrics.keys()) + [name])
+            
             metrics = LayerMetrics(
                 name=name,
                 layer_type='LayerNorm',
@@ -740,8 +719,19 @@ class SwinEnclaveProfiler:
                 output_shape=output_shape,
                 input_bytes=_shape_to_bytes(input_shape),
                 output_bytes=_shape_to_bytes(output_shape),
+                dependencies=dependencies,
                 enclave_times=times,
-                num_iterations=self.num_iterations
+                num_iterations=self.num_iterations,
+                # Memory analysis fields
+                cpu_memory_bytes=mem_info['cpu_memory_bytes'],
+                tee_memory_bytes=mem_info['tee_memory_bytes'],
+                tee_encryption_overhead=mem_info['tee_encryption_overhead'],
+                tee_total_memory_bytes=mem_info['tee_total_memory_bytes'],
+                weight_bytes=mem_info['weight_bytes'],
+                bias_bytes=mem_info['bias_bytes'],
+                activation_bytes=mem_info['activation_bytes'],
+                num_chunks=mem_info['num_chunks'],
+                chunk_metadata_bytes=mem_info['chunk_metadata_bytes'],
             )
             self.metrics[name] = metrics
             
@@ -767,7 +757,7 @@ class SwinEnclaveProfiler:
         from python.layers.output import SecretOutputLayer
         from python.sgx_net import SecretNeuralNetwork
         from python.utils.basic_utils import ExecutionModeOptions
-        
+            
         try:
             if not GlobalTensor.is_init_global_tensor:
                 GlobalTensor.init()
@@ -825,6 +815,16 @@ class SwinEnclaveProfiler:
                     times.append(elapsed_ms)
                     self._append_runtime_stats(name, stats)
             
+            # Calculate memory footprint
+            mem_info = calc_layer_memory_from_shapes(
+                layer_type='Softmax',
+                input_shape=input_shape,
+                output_shape=output_shape,
+            )
+            
+            # Infer dependencies
+            dependencies = infer_layer_dependencies(name, list(self.metrics.keys()) + [name])
+            
             metrics = LayerMetrics(
                 name=name,
                 layer_type='Softmax',
@@ -834,8 +834,19 @@ class SwinEnclaveProfiler:
                 output_shape=output_shape,
                 input_bytes=_shape_to_bytes(input_shape),
                 output_bytes=_shape_to_bytes(output_shape),
+                dependencies=dependencies,
                 enclave_times=times,
-                num_iterations=self.num_iterations
+                num_iterations=self.num_iterations,
+                # Memory analysis fields
+                cpu_memory_bytes=mem_info['cpu_memory_bytes'],
+                tee_memory_bytes=mem_info['tee_memory_bytes'],
+                tee_encryption_overhead=mem_info['tee_encryption_overhead'],
+                tee_total_memory_bytes=mem_info['tee_total_memory_bytes'],
+                weight_bytes=mem_info['weight_bytes'],
+                bias_bytes=mem_info['bias_bytes'],
+                activation_bytes=mem_info['activation_bytes'],
+                num_chunks=mem_info['num_chunks'],
+                chunk_metadata_bytes=mem_info['chunk_metadata_bytes'],
             )
             self.metrics[name] = metrics
             
@@ -861,7 +872,7 @@ class SwinEnclaveProfiler:
         from python.layers.output import SecretOutputLayer
         from python.sgx_net import SecretNeuralNetwork
         from python.utils.basic_utils import ExecutionModeOptions
-        
+            
         try:
             if not GlobalTensor.is_init_global_tensor:
                 GlobalTensor.init()
@@ -919,6 +930,16 @@ class SwinEnclaveProfiler:
                     times.append(elapsed_ms)
                     self._append_runtime_stats(name, stats)
             
+            # Calculate memory footprint
+            mem_info = calc_layer_memory_from_shapes(
+                layer_type='GELU',
+                input_shape=input_shape,
+                output_shape=output_shape,
+            )
+            
+            # Infer dependencies
+            dependencies = infer_layer_dependencies(name, list(self.metrics.keys()) + [name])
+            
             metrics = LayerMetrics(
                 name=name,
                 layer_type='GELU',
@@ -928,8 +949,19 @@ class SwinEnclaveProfiler:
                 output_shape=output_shape,
                 input_bytes=_shape_to_bytes(input_shape),
                 output_bytes=_shape_to_bytes(output_shape),
+                dependencies=dependencies,
                 enclave_times=times,
-                num_iterations=self.num_iterations
+                num_iterations=self.num_iterations,
+                # Memory analysis fields
+                cpu_memory_bytes=mem_info['cpu_memory_bytes'],
+                tee_memory_bytes=mem_info['tee_memory_bytes'],
+                tee_encryption_overhead=mem_info['tee_encryption_overhead'],
+                tee_total_memory_bytes=mem_info['tee_total_memory_bytes'],
+                weight_bytes=mem_info['weight_bytes'],
+                bias_bytes=mem_info['bias_bytes'],
+                activation_bytes=mem_info['activation_bytes'],
+                num_chunks=mem_info['num_chunks'],
+                chunk_metadata_bytes=mem_info['chunk_metadata_bytes'],
             )
             self.metrics[name] = metrics
             
@@ -957,7 +989,7 @@ class SwinEnclaveProfiler:
         from python.layers.output import SecretOutputLayer
         from python.sgx_net import SecretNeuralNetwork
         from python.utils.basic_utils import ExecutionModeOptions
-        
+            
         try:
             if not GlobalTensor.is_init_global_tensor:
                 GlobalTensor.init()
@@ -1031,6 +1063,16 @@ class SwinEnclaveProfiler:
                     times.append(elapsed_ms)
                     self._append_runtime_stats(name, stats)
             
+            # Calculate memory footprint
+            mem_info = calc_layer_memory_from_shapes(
+                layer_type='MatMul',
+                input_shape=input_shape,
+                output_shape=output_shape,
+            )
+            
+            # Infer dependencies
+            dependencies = infer_layer_dependencies(name, list(self.metrics.keys()) + [name])
+            
             metrics = LayerMetrics(
                 name=name,
                 layer_type='MatMul',
@@ -1040,8 +1082,19 @@ class SwinEnclaveProfiler:
                 output_shape=output_shape,
                 input_bytes=_shape_to_bytes(input_shape1) + _shape_to_bytes(input_shape2),
                 output_bytes=_shape_to_bytes(output_shape),
+                dependencies=dependencies,
                 enclave_times=times,
-                num_iterations=self.num_iterations
+                num_iterations=self.num_iterations,
+                # Memory analysis fields
+                cpu_memory_bytes=mem_info['cpu_memory_bytes'],
+                tee_memory_bytes=mem_info['tee_memory_bytes'],
+                tee_encryption_overhead=mem_info['tee_encryption_overhead'],
+                tee_total_memory_bytes=mem_info['tee_total_memory_bytes'],
+                weight_bytes=mem_info['weight_bytes'],
+                bias_bytes=mem_info['bias_bytes'],
+                activation_bytes=mem_info['activation_bytes'],
+                num_chunks=mem_info['num_chunks'],
+                chunk_metadata_bytes=mem_info['chunk_metadata_bytes'],
             )
             self.metrics[name] = metrics
             
@@ -1059,13 +1112,13 @@ class SwinEnclaveProfiler:
         """Save profiling results to CSV and JSON."""
         for metrics in self.metrics.values():
             metrics.compute_statistics()
-        
+            
         os.makedirs(output_dir, exist_ok=True)
-        
+            
         variant = self.model_variant
         csv_path = os.path.join(output_dir, f'swin_{variant}_enclave_layers.csv')
         json_path = os.path.join(output_dir, f'swin_{variant}_enclave_layers.json')
-        
+            
         fieldnames = [
             'name', 'type', 'group', 'execution_mode',
             'enclave_time_mean', 'enclave_time_std', 'enclave_time_min', 'enclave_time_max',
@@ -1074,9 +1127,13 @@ class SwinEnclaveProfiler:
             'input_bytes', 'output_bytes',
             'input_shape', 'output_shape',
             'dependencies', 'num_iterations',
-            'xfer_edges_json', 'xfer_total_mean_ms', 'compute_mean_ms'
+            'xfer_edges_json', 'xfer_total_mean_ms', 'compute_mean_ms',
+            # Memory analysis columns
+            'cpu_memory_bytes', 'tee_memory_bytes', 'tee_encryption_overhead',
+            'tee_total_memory_bytes', 'weight_bytes', 'bias_bytes',
+            'activation_bytes', 'num_chunks', 'chunk_metadata_bytes'
         ]
-        
+            
         with open(csv_path, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
@@ -1086,7 +1143,7 @@ class SwinEnclaveProfiler:
                 row['output_shape'] = str(row['output_shape'])
                 row['dependencies'] = str(row['dependencies'])
                 writer.writerow(row)
-        
+            
         with open(json_path, 'w') as f:
             json.dump({
                 'model_config': {
@@ -1109,25 +1166,25 @@ class SwinEnclaveProfiler:
                 },
                 'layers': [m.to_dict() for m in self.metrics.values()],
             }, f, indent=2)
-        
+            
         print(f"\nResults saved to:")
         print(f"  CSV: {csv_path}")
         print(f"  JSON: {json_path}")
-        
+            
         return csv_path, json_path
     
     def print_summary(self):
         """Print summary statistics."""
         for metrics in self.metrics.values():
             metrics.compute_statistics()
-        
+            
         print(f"\n{'='*60}")
         print(f"Swin-{self.model_variant.capitalize()} Enclave Profiling Summary")
         print(f"  (Uses LOCAL window attention: {self.window_size}x{self.window_size})")
         print(f"{'='*60}")
-        
+            
         total_time = sum(m.enclave_time_mean for m in self.metrics.values())
-        
+            
         # Per stage
         stage_times = {}
         for metrics in self.metrics.values():
@@ -1144,7 +1201,7 @@ class SwinEnclaveProfiler:
             if stage not in stage_times:
                 stage_times[stage] = 0.0
             stage_times[stage] += metrics.enclave_time_mean
-        
+            
         print(f"\nPer-Stage Enclave Time:")
         print(f"{'Stage':<20} {'Time (ms)':>12} {'%':>8}")
         print(f"{'-'*40}")
@@ -1153,7 +1210,7 @@ class SwinEnclaveProfiler:
             print(f"{stage:<20} {time_ms:>12.3f} {pct:>8.1f}%")
         print(f"{'-'*40}")
         print(f"{'Total':<20} {total_time:>12.3f} {'100.0':>8}%")
-        
+            
         # Per layer type
         type_times = {}
         type_counts = {}
@@ -1164,7 +1221,7 @@ class SwinEnclaveProfiler:
                 type_counts[ltype] = 0
             type_times[ltype] += metrics.enclave_time_mean
             type_counts[ltype] += 1
-        
+            
         print(f"\nPer-Layer-Type Enclave Time:")
         print(f"{'Type':<15} {'Count':>8} {'Time (ms)':>12} {'%':>8}")
         print(f"{'-'*45}")
@@ -1173,8 +1230,11 @@ class SwinEnclaveProfiler:
             count = type_counts[ltype]
             pct = time_ms / total_time * 100 if total_time > 0 else 0
             print(f"{ltype:<15} {count:>8} {time_ms:>12.3f} {pct:>8.1f}%")
-        
+            
         print(f"\n{'='*60}\n")
+            
+        # Print memory summary
+        print_memory_summary(self.metrics, "Swin Transformer Enclave Memory Analysis")
     
     def _init_runtime_bucket(self, name: str):
         self._runtime_stats[name] = {

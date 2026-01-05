@@ -34,7 +34,7 @@ import json
 import numpy as np
 import os
 from collections import OrderedDict
-from dataclasses import dataclass, field
+
 from typing import Dict, List, Optional, Any, Tuple
 import argparse
 
@@ -48,6 +48,13 @@ except ImportError:
     torch = None
     print("Warning: PyTorch not available")
 
+from experiments.models.profiler_utils import (
+    LayerMetrics,
+    calc_layer_memory_from_shapes,
+    shape_to_bytes,
+    print_memory_summary,
+    infer_layer_dependencies,
+)
 from python.utils.basic_utils import ExecutionModeOptions
 
 
@@ -56,92 +63,10 @@ DEFAULT_NUM_ITERATIONS = 30
 DEFAULT_WARMUP_ITERATIONS = 5
 
 
-@dataclass
-class LayerMetrics:
-    """Data class to store layer profiling metrics."""
-    name: str
-    layer_type: str
-    group: str
-    
-    # Enclave timing statistics (in ms)
-    enclave_time_mean: float = 0.0
-    enclave_time_std: float = 0.0
-    enclave_time_min: float = 0.0
-    enclave_time_max: float = 0.0
-    enclave_time_p95: float = 0.0
-    enclave_time_p99: float = 0.0
-    
-    # CPU timing statistics (in ms)
-    cpu_time_mean: float = 0.0
-    cpu_time_std: float = 0.0
-    cpu_time_min: float = 0.0
-    cpu_time_max: float = 0.0
-    
-    # Data sizes (in bytes)
-    input_bytes: int = 0
-    output_bytes: int = 0
-    
-    # Input/output shapes
-    input_shape: List[int] = field(default_factory=list)
-    output_shape: List[int] = field(default_factory=list)
-    
-    # Dependencies
-    dependencies: List[str] = field(default_factory=list)
-    
-    # Raw timing data
-    enclave_times: List[float] = field(default_factory=list)
-    cpu_times: List[float] = field(default_factory=list)
-    
-    num_iterations: int = 0
-
-    def compute_statistics(self):
-        """Compute statistics from raw timing data."""
-        if self.enclave_times:
-            times = np.array(self.enclave_times)
-            self.enclave_time_mean = float(np.mean(times))
-            self.enclave_time_std = float(np.std(times))
-            self.enclave_time_min = float(np.min(times))
-            self.enclave_time_max = float(np.max(times))
-            self.enclave_time_p95 = float(np.percentile(times, 95))
-            self.enclave_time_p99 = float(np.percentile(times, 99))
-            
-        if self.cpu_times:
-            times = np.array(self.cpu_times)
-            self.cpu_time_mean = float(np.mean(times))
-            self.cpu_time_std = float(np.std(times))
-            self.cpu_time_min = float(np.min(times))
-            self.cpu_time_max = float(np.max(times))
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for serialization."""
-        return {
-            'name': self.name,
-            'type': self.layer_type,
-            'group': self.group,
-            'enclave_time_mean': self.enclave_time_mean,
-            'enclave_time_std': self.enclave_time_std,
-            'enclave_time_min': self.enclave_time_min,
-            'enclave_time_max': self.enclave_time_max,
-            'enclave_time_p95': self.enclave_time_p95,
-            'enclave_time_p99': self.enclave_time_p99,
-            'cpu_time_mean': self.cpu_time_mean,
-            'cpu_time_std': self.cpu_time_std,
-            'cpu_time_min': self.cpu_time_min,
-            'cpu_time_max': self.cpu_time_max,
-            'input_bytes': self.input_bytes,
-            'output_bytes': self.output_bytes,
-            'input_shape': self.input_shape,
-            'output_shape': self.output_shape,
-            'dependencies': self.dependencies,
-            'num_iterations': self.num_iterations,
-        }
-
 
 def _shape_to_bytes(shape: List[int]) -> int:
     """Convert shape to size in bytes (assuming float32)."""
-    if not shape:
-        return 0
-    return int(np.prod(shape)) * 4
+    return shape_to_bytes(shape)
 
 
 # ============================================================================
@@ -460,16 +385,38 @@ class SwinPureProfiler:
             end = time.perf_counter()
             times.append((end - start) * 1000)
         
+        # Calculate memory footprint
+        layer_type = type(layer).__name__
+        mem_info = calc_layer_memory_from_shapes(
+            layer_type=layer_type,
+            input_shape=input_shape,
+            output_shape=output_shape,
+        )
+        
+        # Infer dependencies
+        dependencies = infer_layer_dependencies(name, list(self.metrics.keys()) + [name])
+        
         metrics = LayerMetrics(
             name=name,
-            layer_type=type(layer).__name__,
+            layer_type=layer_type,
             group=group,
             input_shape=input_shape,
             output_shape=output_shape,
             input_bytes=_shape_to_bytes(input_shape),
             output_bytes=_shape_to_bytes(output_shape),
+            dependencies=dependencies,
             cpu_times=times,
-            num_iterations=self.num_iterations
+            num_iterations=self.num_iterations,
+            # Memory analysis fields
+            cpu_memory_bytes=mem_info['cpu_memory_bytes'],
+            tee_memory_bytes=mem_info['tee_memory_bytes'],
+            tee_encryption_overhead=mem_info['tee_encryption_overhead'],
+            tee_total_memory_bytes=mem_info['tee_total_memory_bytes'],
+            weight_bytes=mem_info['weight_bytes'],
+            bias_bytes=mem_info['bias_bytes'],
+            activation_bytes=mem_info['activation_bytes'],
+            num_chunks=mem_info['num_chunks'],
+            chunk_metadata_bytes=mem_info['chunk_metadata_bytes'],
         )
         self.metrics[name] = metrics
         
@@ -493,6 +440,16 @@ class SwinPureProfiler:
             end = time.perf_counter()
             times.append((end - start) * 1000)
         
+        # Calculate memory footprint
+        mem_info = calc_layer_memory_from_shapes(
+            layer_type='MatMul',
+            input_shape=input_shape,
+            output_shape=output_shape,
+        )
+        
+        # Infer dependencies
+        dependencies = infer_layer_dependencies(name, list(self.metrics.keys()) + [name])
+        
         metrics = LayerMetrics(
             name=name,
             layer_type='MatMul',
@@ -501,8 +458,19 @@ class SwinPureProfiler:
             output_shape=output_shape,
             input_bytes=_shape_to_bytes(input_shape),
             output_bytes=_shape_to_bytes(output_shape),
+            dependencies=dependencies,
             cpu_times=times,
-            num_iterations=self.num_iterations
+            num_iterations=self.num_iterations,
+            # Memory analysis fields
+            cpu_memory_bytes=mem_info['cpu_memory_bytes'],
+            tee_memory_bytes=mem_info['tee_memory_bytes'],
+            tee_encryption_overhead=mem_info['tee_encryption_overhead'],
+            tee_total_memory_bytes=mem_info['tee_total_memory_bytes'],
+            weight_bytes=mem_info['weight_bytes'],
+            bias_bytes=mem_info['bias_bytes'],
+            activation_bytes=mem_info['activation_bytes'],
+            num_chunks=mem_info['num_chunks'],
+            chunk_metadata_bytes=mem_info['chunk_metadata_bytes'],
         )
         self.metrics[name] = metrics
         
@@ -527,6 +495,16 @@ class SwinPureProfiler:
             end = time.perf_counter()
             times.append((end - start) * 1000)
         
+        # Calculate memory footprint
+        mem_info = calc_layer_memory_from_shapes(
+            layer_type='Softmax',
+            input_shape=input_shape,
+            output_shape=output_shape,
+        )
+        
+        # Infer dependencies
+        dependencies = infer_layer_dependencies(name, list(self.metrics.keys()) + [name])
+        
         metrics = LayerMetrics(
             name=name,
             layer_type='Softmax',
@@ -535,8 +513,19 @@ class SwinPureProfiler:
             output_shape=output_shape,
             input_bytes=_shape_to_bytes(input_shape),
             output_bytes=_shape_to_bytes(output_shape),
+            dependencies=dependencies,
             cpu_times=times,
-            num_iterations=self.num_iterations
+            num_iterations=self.num_iterations,
+            # Memory analysis fields
+            cpu_memory_bytes=mem_info['cpu_memory_bytes'],
+            tee_memory_bytes=mem_info['tee_memory_bytes'],
+            tee_encryption_overhead=mem_info['tee_encryption_overhead'],
+            tee_total_memory_bytes=mem_info['tee_total_memory_bytes'],
+            weight_bytes=mem_info['weight_bytes'],
+            bias_bytes=mem_info['bias_bytes'],
+            activation_bytes=mem_info['activation_bytes'],
+            num_chunks=mem_info['num_chunks'],
+            chunk_metadata_bytes=mem_info['chunk_metadata_bytes'],
         )
         self.metrics[name] = metrics
         
@@ -573,6 +562,16 @@ class SwinPureProfiler:
             end = time.perf_counter()
             times.append((end - start) * 1000)
         
+        # Calculate memory footprint
+        mem_info = calc_layer_memory_from_shapes(
+            layer_type='GELU',
+            input_shape=input_shape,
+            output_shape=output_shape,
+        )
+        
+        # Infer dependencies
+        dependencies = infer_layer_dependencies(name, list(self.metrics.keys()) + [name])
+        
         metrics = LayerMetrics(
             name=name,
             layer_type='GELU',
@@ -581,8 +580,19 @@ class SwinPureProfiler:
             output_shape=output_shape,
             input_bytes=_shape_to_bytes(input_shape),
             output_bytes=_shape_to_bytes(output_shape),
+            dependencies=dependencies,
             cpu_times=times,
-            num_iterations=self.num_iterations
+            num_iterations=self.num_iterations,
+            # Memory analysis fields
+            cpu_memory_bytes=mem_info['cpu_memory_bytes'],
+            tee_memory_bytes=mem_info['tee_memory_bytes'],
+            tee_encryption_overhead=mem_info['tee_encryption_overhead'],
+            tee_total_memory_bytes=mem_info['tee_total_memory_bytes'],
+            weight_bytes=mem_info['weight_bytes'],
+            bias_bytes=mem_info['bias_bytes'],
+            activation_bytes=mem_info['activation_bytes'],
+            num_chunks=mem_info['num_chunks'],
+            chunk_metadata_bytes=mem_info['chunk_metadata_bytes'],
         )
         self.metrics[name] = metrics
         
@@ -600,13 +610,17 @@ class SwinPureProfiler:
         json_path = os.path.join(output_dir, f'swin_{variant}_layers.json')
         
         fieldnames = [
-            'name', 'type', 'group',
+            'name', 'type', 'group', 'execution_mode',
             'cpu_time_mean', 'cpu_time_std', 'cpu_time_min', 'cpu_time_max',
             'enclave_time_mean', 'enclave_time_std', 'enclave_time_min', 'enclave_time_max',
             'enclave_time_p95', 'enclave_time_p99',
             'input_bytes', 'output_bytes',
             'input_shape', 'output_shape',
-            'dependencies', 'num_iterations'
+            'dependencies', 'num_iterations',
+            # Memory analysis columns
+            'cpu_memory_bytes', 'tee_memory_bytes', 'tee_encryption_overhead',
+            'tee_total_memory_bytes', 'weight_bytes', 'bias_bytes',
+            'activation_bytes', 'num_chunks', 'chunk_metadata_bytes'
         ]
         
         with open(csv_path, 'w', newline='') as f:
@@ -705,6 +719,9 @@ class SwinPureProfiler:
             print(f"{ltype:<20} {count:>8} {time_ms:>12.3f} {pct:>8.1f}%")
         
         print(f"\n{'='*60}\n")
+        
+        # Print memory summary
+        print_memory_summary(self.metrics, "Swin Transformer Memory Analysis")
 
 
 def main():
