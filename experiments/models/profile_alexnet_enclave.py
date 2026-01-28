@@ -48,6 +48,8 @@ class AlexNetEnclaveProfiler:
         self.metrics: Dict[str, LayerMetrics] = OrderedDict()
         self.reuse_single_enclave: bool = True
         self._runtime_stats: Dict[str, Dict[str, List[float]]] = {}
+        # Keep network objects alive to prevent GC from destroying Enclave
+        self._network_pool: List[Any] = []
 
     def _init_runtime_bucket(self, name: str):
         self._runtime_stats[name] = {
@@ -121,7 +123,7 @@ class AlexNetEnclaveProfiler:
             
             return self.metrics
         finally:
-            if (not self.reuse_single_enclave) and GlobalTensor.is_init_global_tensor:
+            if GlobalTensor.is_init_global_tensor:
                 GlobalTensor.destroy()
 
     def _profile_conv_enclave(self, name, input_shape, out_channels, k, s, p, group, verbose):
@@ -135,11 +137,9 @@ class AlexNetEnclaveProfiler:
         self._init_runtime_bucket(name)
         
         # Calculate output shape
-        # H_out = (H_in + 2*p - k) // s + 1
         h_out = (input_shape[2] + 2*p - k) // s + 1
         output_shape = [input_shape[0], out_channels, h_out, h_out]
         
-        layers = []
         in_layer = SecretInputLayer(sid, f"{name}_in", input_shape, ExecutionModeOptions.Enclave)
         conv_layer = SGXConvBase(
             sid, name, ExecutionModeOptions.Enclave, 
@@ -161,6 +161,7 @@ class AlexNetEnclaveProfiler:
         sn = SecretNeuralNetwork(sid, name)
         sn.set_eid(GlobalTensor.get_eid())
         sn.set_layers(layers)
+        self._network_pool.append(sn)  # Prevent GC
         
         times = []
         for i in range(self.warmup_iterations + self.num_iterations):
@@ -213,6 +214,7 @@ class AlexNetEnclaveProfiler:
         sn = SecretNeuralNetwork(sid, name)
         sn.set_eid(GlobalTensor.get_eid())
         sn.set_layers([in_layer, fc_layer, out_layer])
+        self._network_pool.append(sn)  # Prevent GC
         
         times = []
         for i in range(self.warmup_iterations + self.num_iterations):
@@ -291,7 +293,7 @@ class AlexNetEnclaveProfiler:
         h_out = (input_shape[2] + 2*p - k) // s + 1
         output_shape = [input_shape[0], input_shape[1], h_out, h_out]
         
-        in_layer = SecretInputLayer(sid, f"{name}_in", input_shape, ExecutionModeOptions.CPU) # Pool often fallback to CPU
+        in_layer = SecretInputLayer(sid, f"{name}_in", input_shape, ExecutionModeOptions.CPU) 
         pool_layer = SecretMaxpool2dLayer(sid, name, ExecutionModeOptions.CPU, filter_hw=k, stride=s, padding=p)
         pool_layer.register_prev_layer(in_layer)
         
