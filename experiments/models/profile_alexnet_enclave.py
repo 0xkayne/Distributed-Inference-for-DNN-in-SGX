@@ -90,32 +90,71 @@ class AlexNetEnclaveProfiler:
                 GlobalTensor.init()
             
             # Conv1 Block
-            self._profile_conv_enclave("conv1", [self.batch_size, 3, 224, 224], 
-                                      96, 11, 4, 2, "Feature", verbose)
-            self._profile_relu_enclave("relu1", [self.batch_size, 96, 55, 55], "Feature", verbose)
-            self._profile_maxpool_enclave("pool1", [self.batch_size, 96, 55, 55], 3, 2, 0, "Feature", verbose)
+            self._profile_conv_enclave(
+                "conv1", [self.batch_size, 3, 224, 224], 
+                96, 11, 4, 2, "Feature", verbose,
+                dependencies=[]  # First layer, no dependencies
+            )
+            self._profile_relu_enclave(
+                "relu1", [self.batch_size, 96, 55, 55], "Feature", verbose,
+                dependencies=["conv1"]
+            )
+            self._profile_maxpool_enclave(
+                "pool1", [self.batch_size, 96, 55, 55], 3, 2, 0, "Feature", verbose,
+                dependencies=["relu1"]
+            )
             
             # Conv2 Block
-            self._profile_conv_enclave("conv2", [self.batch_size, 96, 27, 27], 
-                                      256, 5, 1, 2, "Feature", verbose)
-            self._profile_relu_enclave("relu2", [self.batch_size, 256, 27, 27], "Feature", verbose)
-            self._profile_maxpool_enclave("pool2", [self.batch_size, 256, 27, 27], 3, 2, 0, "Feature", verbose)
+            self._profile_conv_enclave(
+                "conv2", [self.batch_size, 96, 27, 27], 
+                256, 5, 1, 2, "Feature", verbose,
+                dependencies=["pool1"]
+            )
+            self._profile_relu_enclave(
+                "relu2", [self.batch_size, 256, 27, 27], "Feature", verbose,
+                dependencies=["conv2"]
+            )
+            self._profile_maxpool_enclave(
+                "pool2", [self.batch_size, 256, 27, 27], 3, 2, 0, "Feature", verbose,
+                dependencies=["relu2"]
+            )
             
             # Conv3 Block
-            self._profile_conv_enclave("conv3", [self.batch_size, 256, 13, 13], 
-                                      384, 3, 1, 1, "Feature", verbose)
-            self._profile_relu_enclave("relu3", [self.batch_size, 384, 13, 13], "Feature", verbose)
+            self._profile_conv_enclave(
+                "conv3", [self.batch_size, 256, 13, 13], 
+                384, 3, 1, 1, "Feature", verbose,
+                dependencies=["pool2"]
+            )
+            self._profile_relu_enclave(
+                "relu3", [self.batch_size, 384, 13, 13], "Feature", verbose,
+                dependencies=["conv3"]
+            )
             
             # Conv4 Block
-            self._profile_conv_enclave("conv4", [self.batch_size, 384, 13, 13], 
-                                      384, 3, 1, 1, "Feature", verbose)
-            self._profile_relu_enclave("relu4", [self.batch_size, 384, 13, 13], "Feature", verbose)
+            self._profile_conv_enclave(
+                "conv4", [self.batch_size, 384, 13, 13], 
+                384, 3, 1, 1, "Feature", verbose,
+                dependencies=["relu3"]
+            )
+            self._profile_relu_enclave(
+                "relu4", [self.batch_size, 384, 13, 13], "Feature", verbose,
+                dependencies=["conv4"]
+            )
             
             # Conv5 Block
-            self._profile_conv_enclave("conv5", [self.batch_size, 384, 13, 13], 
-                                      256, 3, 1, 1, "Feature", verbose)
-            self._profile_relu_enclave("relu5", [self.batch_size, 256, 13, 13], "Feature", verbose)
-            self._profile_maxpool_enclave("pool3", [self.batch_size, 256, 13, 13], 3, 2, 0, "Feature", verbose)
+            self._profile_conv_enclave(
+                "conv5", [self.batch_size, 384, 13, 13], 
+                256, 3, 1, 1, "Feature", verbose,
+                dependencies=["relu4"]
+            )
+            self._profile_relu_enclave(
+                "relu5", [self.batch_size, 256, 13, 13], "Feature", verbose,
+                dependencies=["conv5"]
+            )
+            self._profile_maxpool_enclave(
+                "pool3", [self.batch_size, 256, 13, 13], 3, 2, 0, "Feature", verbose,
+                dependencies=["relu5"]
+            )
             
             # Reset Enclave before HUGE FC layers to ensure EPC space
             if verbose: print("\n[Resetting Enclave before FC layers...]")
@@ -123,8 +162,15 @@ class AlexNetEnclaveProfiler:
             GlobalTensor.init()
             
             # FC1 (9216 -> 4096)
-            self._profile_linear_enclave("fc1", [self.batch_size, 9216], 4096, "Classifier", verbose)
-            self._profile_relu_enclave("relu_fc1", [self.batch_size, 4096], "Classifier", verbose)
+            # Note: Still depends on pool3, even though Enclave was reset
+            self._profile_linear_enclave(
+                "fc1", [self.batch_size, 9216], 4096, "Classifier", verbose,
+                dependencies=["pool3"]  # Correct dependency across Enclave reset
+            )
+            self._profile_relu_enclave(
+                "relu_fc1", [self.batch_size, 4096], "Classifier", verbose,
+                dependencies=["fc1"]
+            )
             
             # Reset again before FC2
             if verbose: print("[Resetting Enclave for FC2...]")
@@ -132,11 +178,20 @@ class AlexNetEnclaveProfiler:
             GlobalTensor.init()
             
             # FC2 (4096 -> 4096)
-            self._profile_linear_enclave("fc2", [self.batch_size, 4096], 4096, "Classifier", verbose)
-            self._profile_relu_enclave("relu_fc2", [self.batch_size, 4096], "Classifier", verbose)
+            self._profile_linear_enclave(
+                "fc2", [self.batch_size, 4096], 4096, "Classifier", verbose,
+                dependencies=["relu_fc1"]  # Correct dependency across Enclave reset
+            )
+            self._profile_relu_enclave(
+                "relu_fc2", [self.batch_size, 4096], "Classifier", verbose,
+                dependencies=["fc2"]
+            )
             
             # FC3 (4096 -> 1000)
-            self._profile_linear_enclave("fc3", [self.batch_size, 4096], 1000, "Classifier", verbose)
+            self._profile_linear_enclave(
+                "fc3", [self.batch_size, 4096], 1000, "Classifier", verbose,
+                dependencies=["relu_fc2"]
+            )
             
             return self.metrics
 
@@ -150,7 +205,8 @@ class AlexNetEnclaveProfiler:
                 writer.writerow(metrics_to_csv_row(m))
         print(f"\nProfiling results saved to {output_file}")
 
-    def _profile_conv_enclave(self, name, input_shape, out_channels, k, s, p, group, verbose):
+    def _profile_conv_enclave(self, name, input_shape, out_channels, k, s, p, group, verbose,
+                              dependencies: Optional[List[str]] = None):
         import torch
         from python.enclave_interfaces import GlobalTensor
         from python.layers.sgx_conv_base import SGXConvBase
@@ -201,11 +257,13 @@ class AlexNetEnclaveProfiler:
                     self._append_runtime_stats(name, stats)
             
             mem = calc_layer_memory_from_shapes("Conv2d", input_shape, output_shape, kernel_size=k)
-            deps = [self.last_layer_name] if self.last_layer_name else []
+            # Use provided dependencies or fallback to last_layer_name
+            if dependencies is None:
+                dependencies = [self.last_layer_name] if self.last_layer_name else []
             m = LayerMetrics(name, "Conv2d", group, "Enclave", 
                             input_shape=input_shape, output_shape=output_shape,
                             input_bytes=_shape_to_bytes(input_shape), output_bytes=_shape_to_bytes(output_shape),
-                            dependencies=deps,
+                            dependencies=dependencies,
                             enclave_times=times, num_iterations=self.num_iterations,
                             enclave_get_ms=self._runtime_stats[name]['get_ms'],
                             enclave_get2_ms=self._runtime_stats[name]['get2_ms'],
@@ -221,7 +279,8 @@ class AlexNetEnclaveProfiler:
             if (not self.reuse_single_enclave) and GlobalTensor.is_init_global_tensor:
                 GlobalTensor.destroy()
 
-    def _profile_linear_enclave(self, name, input_shape, out_features, group, verbose):
+    def _profile_linear_enclave(self, name, input_shape, out_features, group, verbose,
+                                dependencies: Optional[List[str]] = None):
         import torch
         from python.enclave_interfaces import GlobalTensor
         from python.layers.sgx_linear_base import SGXLinearBase
@@ -262,11 +321,13 @@ class AlexNetEnclaveProfiler:
                     self._append_runtime_stats(name, stats)
             
             mem = calc_layer_memory_from_shapes("Linear", input_shape, output_shape)
-            deps = [self.last_layer_name] if self.last_layer_name else []
+            # Use provided dependencies or fallback to last_layer_name
+            if dependencies is None:
+                dependencies = [self.last_layer_name] if self.last_layer_name else []
             m = LayerMetrics(name, "Linear", group, "Enclave", 
                             input_shape=input_shape, output_shape=output_shape,
                             input_bytes=_shape_to_bytes(input_shape), output_bytes=_shape_to_bytes(output_shape),
-                            dependencies=deps,
+                            dependencies=dependencies,
                             enclave_times=times, num_iterations=self.num_iterations,
                             enclave_get_ms=self._runtime_stats[name]['get_ms'],
                             enclave_get2_ms=self._runtime_stats[name]['get2_ms'],
@@ -282,7 +343,8 @@ class AlexNetEnclaveProfiler:
             if (not self.reuse_single_enclave) and GlobalTensor.is_init_global_tensor:
                 GlobalTensor.destroy()
 
-    def _profile_relu_enclave(self, name, input_shape, group, verbose):
+    def _profile_relu_enclave(self, name, input_shape, group, verbose,
+                              dependencies: Optional[List[str]] = None):
         import torch
         from python.enclave_interfaces import GlobalTensor
         from python.layers.relu import SecretReLULayer
@@ -318,11 +380,13 @@ class AlexNetEnclaveProfiler:
                     self._append_runtime_stats(name, stats)
             
             mem = calc_layer_memory_from_shapes("ReLU", input_shape, input_shape)
-            deps = [self.last_layer_name] if self.last_layer_name else []
+            # Use provided dependencies or fallback to last_layer_name
+            if dependencies is None:
+                dependencies = [self.last_layer_name] if self.last_layer_name else []
             m = LayerMetrics(name, "ReLU", group, "Enclave", 
                             input_shape=input_shape, output_shape=input_shape,
                             input_bytes=_shape_to_bytes(input_shape), output_bytes=_shape_to_bytes(input_shape),
-                            dependencies=deps,
+                            dependencies=dependencies,
                             enclave_times=times, num_iterations=self.num_iterations,
                             enclave_get_ms=self._runtime_stats[name]['get_ms'],
                             enclave_get2_ms=self._runtime_stats[name]['get2_ms'],
@@ -338,7 +402,8 @@ class AlexNetEnclaveProfiler:
             if (not self.reuse_single_enclave) and GlobalTensor.is_init_global_tensor:
                 GlobalTensor.destroy()
 
-    def _profile_maxpool_enclave(self, name, input_shape, k, s, p, group, verbose):
+    def _profile_maxpool_enclave(self, name, input_shape, k, s, p, group, verbose,
+                                  dependencies: Optional[List[str]] = None):
         import torch
         from python.enclave_interfaces import GlobalTensor
         from python.layers.maxpool2d import SecretMaxpool2dLayer
@@ -370,11 +435,13 @@ class AlexNetEnclaveProfiler:
                 times.append(elapsed)
         
         mem = calc_layer_memory_from_shapes("MaxPool", input_shape, output_shape)
-        deps = [self.last_layer_name] if self.last_layer_name else []
+        # Use provided dependencies or fallback to last_layer_name
+        if dependencies is None:
+            dependencies = [self.last_layer_name] if self.last_layer_name else []
         m = LayerMetrics(name, "MaxPool", group, "CPU", 
                         input_shape=input_shape, output_shape=output_shape,
                         input_bytes=_shape_to_bytes(input_shape), output_bytes=_shape_to_bytes(output_shape),
-                        dependencies=deps,
+                        dependencies=dependencies,
                         enclave_times=times, num_iterations=self.num_iterations,
                         **mem)
         m.compute_statistics()
