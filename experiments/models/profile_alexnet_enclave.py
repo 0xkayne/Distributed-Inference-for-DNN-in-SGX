@@ -46,6 +46,7 @@ class AlexNetEnclaveProfiler:
         self.warmup_iterations = warmup_iterations
         self.config = AlexNetConfig(batch_size=batch_size)
         self.metrics: Dict[str, LayerMetrics] = OrderedDict()
+        self.reuse_single_enclave: bool = True
         self._runtime_stats: Dict[str, Dict[str, List[float]]] = {}
 
     def _init_runtime_bucket(self, name: str):
@@ -120,7 +121,7 @@ class AlexNetEnclaveProfiler:
             
             return self.metrics
         finally:
-            if GlobalTensor.is_init_global_tensor:
+            if (not self.reuse_single_enclave) and GlobalTensor.is_init_global_tensor:
                 GlobalTensor.destroy()
 
     def _profile_conv_enclave(self, name, input_shape, out_channels, k, s, p, group, verbose):
