@@ -1,12 +1,23 @@
+import sys
+import os
+sys.path.insert(0, '.')
 import torch
 import torch.nn as nn
 import numpy as np
 import time
 import csv
 import os
-from collections import defaultdict
-from typing import List, Dict, Any
+from collections import defaultdict, OrderedDict
+from typing import List, Dict, Any, Optional
 
+from experiments.models.profiler_utils import (
+    LayerMetrics,
+    calc_layer_memory_from_shapes,
+    shape_to_bytes,
+    print_memory_summary,
+    CSV_FIELDNAMES,
+    metrics_to_csv_row
+)
 from python.layers.input import SecretInputLayer
 from python.layers.sgx_conv_base import SGXConvBase
 from python.layers.sgx_linear_base import SGXLinearBase
@@ -24,9 +35,11 @@ class ResNetEnclaveProfiler:
     def __init__(self, warmup_iterations: int = 2, num_iterations: int = 5):
         self.warmup_iterations = warmup_iterations
         self.num_iterations = num_iterations
+        self.metrics: Dict[str, LayerMetrics] = OrderedDict()
         self._runtime_stats = defaultdict(lambda: defaultdict(list))
         self._layer_pool = []
         self.reuse_single_enclave = True
+        self.last_layer_name = None
 
     def _init_runtime_bucket(self, name: str):
         if name not in self._runtime_stats:
@@ -57,7 +70,7 @@ class ResNetEnclaveProfiler:
         for layer in layers:
             layer.init(start_enclave=False)
 
-    def _profile_conv_enclave(self, name, input_shape, out_channels, k, s, p, group=1, verbose=True):
+    def _profile_conv_enclave(self, name, input_shape, out_channels, k, s, p, group="Feature", dependencies=None, verbose=True):
         self._init_runtime_bucket(name)
         sid = 0
         if verbose:
@@ -66,6 +79,9 @@ class ResNetEnclaveProfiler:
         try:
             if not GlobalTensor.is_init_global_tensor:
                 GlobalTensor.init()
+
+            h_out = (input_shape[2] + 2*p - k) // s + 1
+            output_shape = [input_shape[0], out_channels, h_out, h_out]
 
             in_layer = SecretInputLayer(sid, f"{name}_in", input_shape, ExecutionModeOptions.Enclave)
             conv_layer = SGXConvBase(
@@ -82,10 +98,8 @@ class ResNetEnclaveProfiler:
             for i in range(self.warmup_iterations + self.num_iterations):
                 in_layer.set_input(torch.randn(*input_shape))
                 
-                torch.cuda.synchronize() if torch.cuda.is_available() else None
                 start = time.perf_counter()
                 conv_layer.forward()
-                torch.cuda.synchronize() if torch.cuda.is_available() else None
                 end = time.perf_counter()
                 
                 if i >= self.warmup_iterations:
@@ -93,12 +107,29 @@ class ResNetEnclaveProfiler:
                     stats = GlobalTensor.EnclaveInterface.get_layer_runtime_stats(name)
                     self._append_runtime_stats(name, stats)
             
-            self._runtime_stats[name]['total_python_ms'] = times
+            mem = calc_layer_memory_from_shapes("Conv2d", input_shape, output_shape, kernel_size=k)
+            if dependencies is None:
+                dependencies = [self.last_layer_name] if self.last_layer_name else []
+            
+            m = LayerMetrics(name, "Conv2d", group, "Enclave", 
+                            input_shape=input_shape, output_shape=output_shape,
+                            input_bytes=shape_to_bytes(input_shape), output_bytes=shape_to_bytes(output_shape),
+                            dependencies=dependencies,
+                            enclave_times=times, num_iterations=self.num_iterations,
+                            enclave_get_ms=self._runtime_stats[name]['get_ms'],
+                            enclave_get2_ms=self._runtime_stats[name]['get2_ms'],
+                            enclave_compute_ms=self._runtime_stats[name]['compute_ms'],
+                            enclave_store_ms=self._runtime_stats[name]['store_ms'],
+                            **mem)
+            m.compute_statistics()
+            self.metrics[name] = m
+            self.last_layer_name = name
+
         finally:
             if (not self.reuse_single_enclave) and GlobalTensor.is_init_global_tensor:
                 GlobalTensor.destroy()
 
-    def _profile_bn_enclave(self, name, input_shape, verbose=True):
+    def _profile_bn_enclave(self, name, input_shape, group="Feature", dependencies=None, verbose=True):
         self._init_runtime_bucket(name)
         sid = 0
         if verbose:
@@ -128,12 +159,29 @@ class ResNetEnclaveProfiler:
                     stats = GlobalTensor.EnclaveInterface.get_layer_runtime_stats(name)
                     self._append_runtime_stats(name, stats)
             
-            self._runtime_stats[name]['total_python_ms'] = times
+            mem = calc_layer_memory_from_shapes("BatchNorm", input_shape, input_shape)
+            if dependencies is None:
+                dependencies = [self.last_layer_name] if self.last_layer_name else []
+
+            m = LayerMetrics(name, "BatchNorm", group, "Enclave", 
+                            input_shape=input_shape, output_shape=input_shape,
+                            input_bytes=shape_to_bytes(input_shape), output_bytes=shape_to_bytes(input_shape),
+                            dependencies=dependencies,
+                            enclave_times=times, num_iterations=self.num_iterations,
+                            enclave_get_ms=self._runtime_stats[name]['get_ms'],
+                            enclave_get2_ms=self._runtime_stats[name]['get2_ms'],
+                            enclave_compute_ms=self._runtime_stats[name]['compute_ms'],
+                            enclave_store_ms=self._runtime_stats[name]['store_ms'],
+                            **mem)
+            m.compute_statistics()
+            self.metrics[name] = m
+            self.last_layer_name = name
+
         finally:
             if (not self.reuse_single_enclave) and GlobalTensor.is_init_global_tensor:
                 GlobalTensor.destroy()
 
-    def _profile_relu_enclave(self, name, input_shape, verbose=True):
+    def _profile_relu_enclave(self, name, input_shape, group="Feature", dependencies=None, verbose=True):
         self._init_runtime_bucket(name)
         sid = 0
         try:
@@ -157,14 +205,36 @@ class ResNetEnclaveProfiler:
                     times.append((end - start) * 1000)
                     stats = GlobalTensor.EnclaveInterface.get_layer_runtime_stats(name)
                     self._append_runtime_stats(name, stats)
-            self._runtime_stats[name]['total_python_ms'] = times
+            
+            mem = calc_layer_memory_from_shapes("ReLU", input_shape, input_shape)
+            if dependencies is None:
+                dependencies = [self.last_layer_name] if self.last_layer_name else []
+
+            m = LayerMetrics(name, "ReLU", group, "Enclave", 
+                            input_shape=input_shape, output_shape=input_shape,
+                            input_bytes=shape_to_bytes(input_shape), output_bytes=shape_to_bytes(input_shape),
+                            dependencies=dependencies,
+                            enclave_times=times, num_iterations=self.num_iterations,
+                            enclave_get_ms=self._runtime_stats[name]['get_ms'],
+                            enclave_get2_ms=self._runtime_stats[name]['get2_ms'],
+                            enclave_compute_ms=self._runtime_stats[name]['compute_ms'],
+                            enclave_store_ms=self._runtime_stats[name]['store_ms'],
+                            **mem)
+            m.compute_statistics()
+            self.metrics[name] = m
+            self.last_layer_name = name
+
         finally:
             if (not self.reuse_single_enclave) and GlobalTensor.is_init_global_tensor:
                 GlobalTensor.destroy()
 
-    def _profile_maxpool_enclave(self, name, input_shape, k, s, p, verbose=True):
+    def _profile_maxpool_enclave(self, name, input_shape, k, s, p, group="Feature", dependencies=None, verbose=True):
         self._init_runtime_bucket(name)
         sid = 0
+        
+        h_out = (input_shape[2] + 2*p - k) // s + 1
+        output_shape = [input_shape[0], input_shape[1], h_out, h_out]
+
         # MaxPool in this codebase typically runs on CPU (modeled as non-enclave)
         in_layer = SecretInputLayer(sid, f"{name}_in", input_shape, ExecutionModeOptions.CPU)
         pool_layer = SecretMaxpool2dLayer(sid, name, ExecutionModeOptions.CPU, filter_hw=k, stride=s, padding=p)
@@ -181,9 +251,22 @@ class ResNetEnclaveProfiler:
             end = time.perf_counter()
             if i >= self.warmup_iterations:
                 times.append((end - start) * 1000)
-        self._runtime_stats[name]['total_python_ms'] = times
+        
+        mem = calc_layer_memory_from_shapes("MaxPool", input_shape, output_shape)
+        if dependencies is None:
+            dependencies = [self.last_layer_name] if self.last_layer_name else []
 
-    def _profile_add_enclave(self, name, input_shape, verbose=True):
+        m = LayerMetrics(name, "MaxPool", group, "CPU", 
+                        input_shape=input_shape, output_shape=output_shape,
+                        input_bytes=shape_to_bytes(input_shape), output_bytes=shape_to_bytes(output_shape),
+                        dependencies=dependencies,
+                        enclave_times=times, num_iterations=self.num_iterations,
+                        **mem)
+        m.compute_statistics()
+        self.metrics[name] = m
+        self.last_layer_name = name
+
+    def _profile_add_enclave(self, name, input_shape, group="Feature", dependencies=None, verbose=True):
         self._init_runtime_bucket(name)
         sid = 0
         if verbose:
@@ -216,12 +299,30 @@ class ResNetEnclaveProfiler:
                     stats = GlobalTensor.EnclaveInterface.get_layer_runtime_stats(name)
                     self._append_runtime_stats(name, stats)
             
-            self._runtime_stats[name]['total_python_ms'] = times
+            mem = calc_layer_memory_from_shapes("Add", input_shape, input_shape)
+            # Add normally has its own set of dependencies passed in for ResNet
+            if dependencies is None:
+                dependencies = [self.last_layer_name] if self.last_layer_name else []
+
+            m = LayerMetrics(name, "Add", group, "Enclave", 
+                            input_shape=input_shape, output_shape=input_shape,
+                            input_bytes=shape_to_bytes(input_shape), output_bytes=shape_to_bytes(input_shape),
+                            dependencies=dependencies,
+                            enclave_times=times, num_iterations=self.num_iterations,
+                            enclave_get_ms=self._runtime_stats[name]['get_ms'],
+                            enclave_get2_ms=self._runtime_stats[name]['get2_ms'],
+                            enclave_compute_ms=self._runtime_stats[name]['compute_ms'],
+                            enclave_store_ms=self._runtime_stats[name]['store_ms'],
+                            **mem)
+            m.compute_statistics()
+            self.metrics[name] = m
+            self.last_layer_name = name
+
         finally:
             if (not self.reuse_single_enclave) and GlobalTensor.is_init_global_tensor:
                 GlobalTensor.destroy()
 
-    def _profile_avgpool_enclave(self, name, input_shape, k, s, p, verbose=True):
+    def _profile_avgpool_enclave(self, name, input_shape, k, s, p, group="Feature", dependencies=None, verbose=True):
         self._init_runtime_bucket(name)
         sid = 0
         if verbose:
@@ -230,6 +331,9 @@ class ResNetEnclaveProfiler:
         try:
             if not GlobalTensor.is_init_global_tensor:
                 GlobalTensor.init()
+
+            h_out = (input_shape[2] + 2*p - k) // s + 1
+            output_shape = [input_shape[0], input_shape[1], h_out, h_out]
 
             in_layer = SecretInputLayer(sid, f"{name}_in", input_shape, ExecutionModeOptions.Enclave)
             avg_layer = SecretAvgpool2dLayer(sid, name, ExecutionModeOptions.Enclave, filter_hw=k, stride=s, padding=p)
@@ -251,17 +355,36 @@ class ResNetEnclaveProfiler:
                     stats = GlobalTensor.EnclaveInterface.get_layer_runtime_stats(name)
                     self._append_runtime_stats(name, stats)
             
-            self._runtime_stats[name]['total_python_ms'] = times
+            mem = calc_layer_memory_from_shapes("AvgPool", input_shape, output_shape)
+            if dependencies is None:
+                dependencies = [self.last_layer_name] if self.last_layer_name else []
+
+            m = LayerMetrics(name, "AvgPool", group, "Enclave", 
+                            input_shape=input_shape, output_shape=output_shape,
+                            input_bytes=shape_to_bytes(input_shape), output_bytes=shape_to_bytes(output_shape),
+                            dependencies=dependencies,
+                            enclave_times=times, num_iterations=self.num_iterations,
+                            enclave_get_ms=self._runtime_stats[name]['get_ms'],
+                            enclave_get2_ms=self._runtime_stats[name]['get2_ms'],
+                            enclave_compute_ms=self._runtime_stats[name]['compute_ms'],
+                            enclave_store_ms=self._runtime_stats[name]['store_ms'],
+                            **mem)
+            m.compute_statistics()
+            self.metrics[name] = m
+            self.last_layer_name = name
+
         finally:
             if (not self.reuse_single_enclave) and GlobalTensor.is_init_global_tensor:
                 GlobalTensor.destroy()
 
-    def _profile_linear_enclave(self, name, input_shape, out_features, verbose=True):
+    def _profile_linear_enclave(self, name, input_shape, out_features, group="Classifier", dependencies=None, verbose=True):
         self._init_runtime_bucket(name)
         sid = 0
         try:
             if not GlobalTensor.is_init_global_tensor:
                 GlobalTensor.init()
+            
+            output_shape = [input_shape[0], out_features]
 
             in_layer = SecretInputLayer(sid, f"{name}_in", input_shape, ExecutionModeOptions.Enclave)
             fc_layer = SGXLinearBase(
@@ -283,7 +406,25 @@ class ResNetEnclaveProfiler:
                     times.append((end - start) * 1000)
                     stats = GlobalTensor.EnclaveInterface.get_layer_runtime_stats(name)
                     self._append_runtime_stats(name, stats)
-            self._runtime_stats[name]['total_python_ms'] = times
+            
+            mem = calc_layer_memory_from_shapes("Linear", input_shape, output_shape)
+            if dependencies is None:
+                dependencies = [self.last_layer_name] if self.last_layer_name else []
+
+            m = LayerMetrics(name, "Linear", group, "Enclave", 
+                            input_shape=input_shape, output_shape=output_shape,
+                            input_bytes=shape_to_bytes(input_shape), output_bytes=shape_to_bytes(output_shape),
+                            dependencies=dependencies,
+                            enclave_times=times, num_iterations=self.num_iterations,
+                            enclave_get_ms=self._runtime_stats[name]['get_ms'],
+                            enclave_get2_ms=self._runtime_stats[name]['get2_ms'],
+                            enclave_compute_ms=self._runtime_stats[name]['compute_ms'],
+                            enclave_store_ms=self._runtime_stats[name]['store_ms'],
+                            **mem)
+            m.compute_statistics()
+            self.metrics[name] = m
+            self.last_layer_name = name
+
         finally:
             if (not self.reuse_single_enclave) and GlobalTensor.is_init_global_tensor:
                 GlobalTensor.destroy()
@@ -292,6 +433,7 @@ class ResNetEnclaveProfiler:
         print("\n" + "="*60)
         print("Profiling ResNet34 Unique Layers")
         print("="*60)
+        self.last_layer_name = None
         
         # Initial layers
         self._profile_conv_enclave("R34_Conv1", [1, 3, 224, 224], 64, 7, 2, 3, verbose=verbose)
@@ -299,16 +441,19 @@ class ResNetEnclaveProfiler:
         self._profile_relu_enclave("R34_ReLU1", [1, 64, 112, 112], verbose=verbose)
         self._profile_maxpool_enclave("R34_MaxPool", [1, 64, 112, 112], 3, 2, 1, verbose=verbose)
 
-        # Basic Stage 1 (56x56x64)
-        self._profile_conv_enclave("R34_S1_Conv3x3", [1, 64, 56, 56], 64, 3, 1, 1, verbose=verbose)
-        self._profile_bn_enclave("R34_S1_BN", [1, 64, 56, 56], verbose=verbose)
-        self._profile_add_enclave("R34_S1_Add", [1, 64, 56, 56], verbose=verbose)
+        # Basic Stage 1 (56x56x64) - Identity is R34_MaxPool
+        identity = "R34_MaxPool"
+        self._profile_conv_enclave("R34_S1_Conv3x3", [1, 64, 56, 56], 64, 3, 1, 1, group="S1", verbose=verbose)
+        self._profile_bn_enclave("R34_S1_BN", [1, 64, 56, 56], group="S1", verbose=verbose)
+        self._profile_add_enclave("R34_S1_Add", [1, 64, 56, 56], group="S1", dependencies=["R34_S1_BN", identity], verbose=verbose)
 
-        # Basic Stage 2 (56->28x28x128)
-        self._profile_conv_enclave("R34_S2_Conv3x3_S2", [1, 64, 56, 56], 128, 3, 2, 1, verbose=verbose)
-        self._profile_conv_enclave("R34_S2_Conv1x1_S2", [1, 64, 56, 56], 128, 1, 2, 0, verbose=verbose) # Downsample
-        self._profile_bn_enclave("R34_S2_BN", [1, 128, 28, 28], verbose=verbose)
-        self._profile_add_enclave("R34_S2_Add", [1, 128, 28, 28], verbose=verbose)
+        # Basic Stage 2 (56->28x28x128) - Identity is R34_S1_Add
+        identity = "R34_S1_Add"
+        self._profile_conv_enclave("R34_S2_Conv3x3_S2", [1, 64, 56, 56], 128, 3, 2, 1, group="S2", verbose=verbose)
+        # Downsample branch
+        self._profile_conv_enclave("R34_S2_Conv1x1_S2", [1, 64, 56, 56], 128, 1, 2, 0, group="S2", dependencies=[identity], verbose=verbose)
+        self._profile_bn_enclave("R34_S2_BN", [1, 128, 28, 28], group="S2", dependencies=["R34_S2_Conv3x3_S2"], verbose=verbose)
+        self._profile_add_enclave("R34_S2_Add", [1, 128, 28, 28], group="S2", dependencies=["R34_S2_BN", "R34_S2_Conv1x1_S2"], verbose=verbose)
 
         # Final layers
         self._profile_avgpool_enclave("R34_AvgPool", [1, 512, 7, 7], 7, 1, 0, verbose=verbose)
@@ -318,60 +463,49 @@ class ResNetEnclaveProfiler:
         print("\n" + "="*60)
         print("Profiling ResNet50 Unique Layers")
         print("="*60)
+        self.last_layer_name = None
         
         # Initial layers (same as R34 for conv1)
         self._profile_conv_enclave("R50_Conv1", [1, 3, 224, 224], 64, 7, 2, 3, verbose=verbose)
+        self._profile_maxpool_enclave("R50_MaxPool", [1, 64, 112, 112], 3, 2, 1, verbose=verbose)
         
-        # Bottleneck Stage 1 (56x56)
+        # Bottleneck Stage 1 (56x56) - Identity is R50_MaxPool
+        identity = "R50_MaxPool"
         # 1x1, 64 -> 3x3, 64 -> 1x1, 256
-        self._profile_conv_enclave("R50_S1_Conv1x1_In", [1, 64, 56, 56], 64, 1, 1, 0, verbose=verbose)
-        self._profile_conv_enclave("R50_S1_Conv3x3", [1, 64, 56, 56], 64, 3, 1, 1, verbose=verbose)
-        self._profile_conv_enclave("R50_S1_Conv1x1_Out", [1, 64, 56, 56], 256, 1, 1, 0, verbose=verbose)
-        self._profile_add_enclave("R50_S1_Add", [1, 256, 56, 56], verbose=verbose)
+        self._profile_conv_enclave("R50_S1_Conv1x1_In", [1, 64, 56, 56], 64, 1, 1, 0, group="S1", verbose=verbose)
+        self._profile_conv_enclave("R50_S1_Conv3x3", [1, 64, 56, 56], 64, 3, 1, 1, group="S1", verbose=verbose)
+        self._profile_conv_enclave("R50_S1_Conv1x1_Out", [1, 64, 56, 56], 256, 1, 1, 0, group="S1", verbose=verbose)
+        self._profile_add_enclave("R50_S1_Add", [1, 256, 56, 56], group="S1", dependencies=["R50_S1_Conv1x1_Out", identity], verbose=verbose)
 
-        # Bottleneck Stage 2 (56->28)
-        self._profile_conv_enclave("R50_S2_Conv1x1_In", [1, 256, 56, 56], 128, 1, 1, 0, verbose=verbose)
-        self._profile_conv_enclave("R50_S2_Conv3x3_S2", [1, 128, 56, 56], 128, 3, 2, 1, verbose=verbose)
-        self._profile_conv_enclave("R50_S2_Conv1x1_Out", [1, 128, 28, 28], 512, 1, 1, 0, verbose=verbose)
-        self._profile_conv_enclave("R50_S2_DS_Conv1x1", [1, 256, 56, 56], 512, 1, 2, 0, verbose=verbose) # Downsample
-        self._profile_add_enclave("R50_S2_Add", [1, 512, 28, 28], verbose=verbose)
+        # Bottleneck Stage 2 (56->28) - Identity is R50_S1_Add
+        identity = "R50_S1_Add"
+        self._profile_conv_enclave("R50_S2_Conv1x1_In", [1, 256, 56, 56], 128, 1, 1, 0, group="S2", verbose=verbose)
+        self._profile_conv_enclave("R50_S2_Conv3x3_S2", [1, 128, 56, 56], 128, 3, 2, 1, group="S2", verbose=verbose)
+        self._profile_conv_enclave("R50_S2_Conv1x1_Out", [1, 128, 28, 28], 512, 1, 1, 0, group="S2", verbose=verbose)
+        self._profile_conv_enclave("R50_S2_DS_Conv1x1", [1, 256, 56, 56], 512, 1, 2, 0, group="S2", dependencies=[identity], verbose=verbose) # Downsample
+        self._profile_add_enclave("R50_S2_Add", [1, 512, 28, 28], group="S2", dependencies=["R50_S2_Conv1x1_Out", "R50_S2_DS_Conv1x1"], verbose=verbose)
 
         # Final layers
         self._profile_avgpool_enclave("R50_AvgPool", [1, 2048, 7, 7], 7, 1, 0, verbose=verbose)
         self._profile_linear_enclave("R50_FC", [1, 2048], 1000, verbose=verbose)
 
-    def save_to_csv(self, filename: str):
-        os.makedirs(os.path.dirname(filename), exist_ok=True)
-        with open(filename, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(['Layer', 'Python_Total_ms', 'SGX_Get_ms', 'SGX_Get2_ms', 'SGX_Compute_ms', 'SGX_Store_ms'])
-            
-            for layer_name, stats in self._runtime_stats.items():
-                py_times = stats['total_python_ms']
-                get_times = stats['get_ms']
-                get2_times = stats['get2_ms']
-                comp_times = stats['compute_ms']
-                store_times = stats['store_ms']
-                
-                if not py_times: continue
-                
-                # Use averages across iterations
-                writer.writerow([
-                    layer_name,
-                    np.mean(py_times),
-                    np.mean(get_times) if get_times else 0,
-                    np.mean(get2_times) if get2_times else 0,
-                    np.mean(comp_times) if comp_times else 0,
-                    np.mean(store_times) if store_times else 0
-                ])
-        print(f"\nResults saved to {filename}")
+    def print_summary(self):
+        print_memory_summary(self.metrics, "ResNet Enclave Memory Summary")
+
+    def save_results(self, output_file: str):
+        """Save profiling results to CSV in aligned format."""
+        os.makedirs(os.path.dirname(output_file), exist_ok=True)
+        with open(output_file, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
+            writer.writeheader()
+            for m in self.metrics.values():
+                writer.writerow(metrics_to_csv_row(m))
+        print(f"\nProfiling results saved to {output_file}")
 
 def main():
     print("="*60)
     print("Profiling ResNet in Enclave Mode")
     print("="*60)
-    
-    profiler = ResNetEnclaveProfiler(warmup_iterations=2, num_iterations=5)
     
     try:
         # 1. Global Enclave Initialization
@@ -379,13 +513,16 @@ def main():
         print("Enclave initialized. Starting profiling...")
         
         # 2. Profile ResNet34
-        profiler.profile_resnet34()
+        profiler34 = ResNetEnclaveProfiler(warmup_iterations=2, num_iterations=5)
+        profiler34.profile_resnet34()
+        profiler34.save_results("experiments/data/resnet34_enclave_layers.csv")
+        profiler34.print_summary()
         
         # 3. Profile ResNet50
-        profiler.profile_resnet50()
-        
-        # 4. Save results
-        profiler.save_to_csv("experiments/data/resnet_enclave_layers.csv")
+        profiler50 = ResNetEnclaveProfiler(warmup_iterations=2, num_iterations=5)
+        profiler50.profile_resnet50()
+        profiler50.save_results("experiments/data/resnet50_enclave_layers.csv")
+        profiler50.print_summary()
         
     finally:
         if GlobalTensor.is_init_global_tensor:

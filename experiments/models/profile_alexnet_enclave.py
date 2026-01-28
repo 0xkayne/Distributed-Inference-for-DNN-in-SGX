@@ -50,6 +50,7 @@ class AlexNetEnclaveProfiler:
         self._runtime_stats: Dict[str, Dict[str, List[float]]] = {}
         # Keep layer objects alive to prevent GC from destroying Enclave
         self._layer_pool: List[Any] = []
+        self.last_layer_name = None
 
     def _init_runtime_bucket(self, name: str):
         self._runtime_stats[name] = {
@@ -138,9 +139,16 @@ class AlexNetEnclaveProfiler:
             self._profile_linear_enclave("fc3", [self.batch_size, 4096], 1000, "Classifier", verbose)
             
             return self.metrics
-        finally:
-            if GlobalTensor.is_init_global_tensor:
-                GlobalTensor.destroy()
+
+    def save_results(self, output_file: str):
+        """Save profiling results to CSV in aligned format."""
+        os.makedirs(os.path.dirname(output_file), exist_ok=True)
+        with open(output_file, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
+            writer.writeheader()
+            for m in self.metrics.values():
+                writer.writerow(metrics_to_csv_row(m))
+        print(f"\nProfiling results saved to {output_file}")
 
     def _profile_conv_enclave(self, name, input_shape, out_channels, k, s, p, group, verbose):
         import torch
@@ -193,9 +201,11 @@ class AlexNetEnclaveProfiler:
                     self._append_runtime_stats(name, stats)
             
             mem = calc_layer_memory_from_shapes("Conv2d", input_shape, output_shape, kernel_size=k)
+            deps = [self.last_layer_name] if self.last_layer_name else []
             m = LayerMetrics(name, "Conv2d", group, "Enclave", 
                             input_shape=input_shape, output_shape=output_shape,
                             input_bytes=_shape_to_bytes(input_shape), output_bytes=_shape_to_bytes(output_shape),
+                            dependencies=deps,
                             enclave_times=times, num_iterations=self.num_iterations,
                             enclave_get_ms=self._runtime_stats[name]['get_ms'],
                             enclave_get2_ms=self._runtime_stats[name]['get2_ms'],
@@ -204,6 +214,7 @@ class AlexNetEnclaveProfiler:
                             **mem)
             m.compute_statistics()
             self.metrics[name] = m
+            self.last_layer_name = name
             if verbose: print(f"  {name:20} {m.enclave_time_mean:8.3f} ms")
         
         finally:
@@ -251,9 +262,11 @@ class AlexNetEnclaveProfiler:
                     self._append_runtime_stats(name, stats)
             
             mem = calc_layer_memory_from_shapes("Linear", input_shape, output_shape)
+            deps = [self.last_layer_name] if self.last_layer_name else []
             m = LayerMetrics(name, "Linear", group, "Enclave", 
                             input_shape=input_shape, output_shape=output_shape,
                             input_bytes=_shape_to_bytes(input_shape), output_bytes=_shape_to_bytes(output_shape),
+                            dependencies=deps,
                             enclave_times=times, num_iterations=self.num_iterations,
                             enclave_get_ms=self._runtime_stats[name]['get_ms'],
                             enclave_get2_ms=self._runtime_stats[name]['get2_ms'],
@@ -262,6 +275,7 @@ class AlexNetEnclaveProfiler:
                             **mem)
             m.compute_statistics()
             self.metrics[name] = m
+            self.last_layer_name = name
             if verbose: print(f"  {name:20} {m.enclave_time_mean:8.3f} ms")
         
         finally:
@@ -304,9 +318,11 @@ class AlexNetEnclaveProfiler:
                     self._append_runtime_stats(name, stats)
             
             mem = calc_layer_memory_from_shapes("ReLU", input_shape, input_shape)
+            deps = [self.last_layer_name] if self.last_layer_name else []
             m = LayerMetrics(name, "ReLU", group, "Enclave", 
                             input_shape=input_shape, output_shape=input_shape,
                             input_bytes=_shape_to_bytes(input_shape), output_bytes=_shape_to_bytes(input_shape),
+                            dependencies=deps,
                             enclave_times=times, num_iterations=self.num_iterations,
                             enclave_get_ms=self._runtime_stats[name]['get_ms'],
                             enclave_get2_ms=self._runtime_stats[name]['get2_ms'],
@@ -315,6 +331,7 @@ class AlexNetEnclaveProfiler:
                             **mem)
             m.compute_statistics()
             self.metrics[name] = m
+            self.last_layer_name = name
             if verbose: print(f"  {name:20} {m.enclave_time_mean:8.3f} ms")
         
         finally:
@@ -353,13 +370,16 @@ class AlexNetEnclaveProfiler:
                 times.append(elapsed)
         
         mem = calc_layer_memory_from_shapes("MaxPool", input_shape, output_shape)
+        deps = [self.last_layer_name] if self.last_layer_name else []
         m = LayerMetrics(name, "MaxPool", group, "CPU", 
                         input_shape=input_shape, output_shape=output_shape,
                         input_bytes=_shape_to_bytes(input_shape), output_bytes=_shape_to_bytes(output_shape),
+                        dependencies=deps,
                         enclave_times=times, num_iterations=self.num_iterations,
                         **mem)
         m.compute_statistics()
         self.metrics[name] = m
+        self.last_layer_name = name
         if verbose: print(f"  {name:20} {m.enclave_time_mean:8.3f} ms (CPU)")
 
 def main():
@@ -372,17 +392,8 @@ def main():
     metrics = profiler.profile_all()
 
     # Save to CSV
-    output_dir = "experiments/data"
-    os.makedirs(output_dir, exist_ok=True)
-    output_file = os.path.join(output_dir, "alexnet_enclave_layers.csv")
-    
-    with open(output_file, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
-        writer.writeheader()
-        for m in metrics.values():
-            writer.writerow(metrics_to_csv_row(m))
-
-    print(f"\nProfiling results saved to {output_file}")
+    output_file = "experiments/data/alexnet_enclave_layers.csv"
+    profiler.save_results(output_file)
     print_memory_summary(metrics, "AlexNet Enclave Memory Summary")
 
 if __name__ == "__main__":
