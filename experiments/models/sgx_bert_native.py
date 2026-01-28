@@ -33,192 +33,11 @@ from python.layers.add import SecretAddLayer
 from python.layers.input import SecretInputLayer
 from python.layers.output import SecretOutputLayer
 from python.utils.basic_utils import ExecutionModeOptions
+from python.layers.attention import create_multi_head_attention
 
 
-class MultiHeadSelfAttention:
-    """
-    Multi-Head Self-Attention module for BERT.
-    
-    Structure:
-    - Input: (B, seq_len, embed_dim)
-    - Q, K, V projections: Linear(embed_dim, embed_dim) each
-    - Attention: Q @ K^T / sqrt(d_k) -> Softmax -> @ V
-    - Output projection: Linear(embed_dim, embed_dim)
-    
-    For SGX, we decompose this into individual operations for profiling.
-    """
-    
-    def __init__(
-        self,
-        sid: int,
-        name_prefix: str,
-        enclave_mode: ExecutionModeOptions,
-        embed_dim: int,
-        num_heads: int,
-        batch_size: int = 1,
-        seq_len: int = 128,
-        layer_mode_overrides: Optional[Dict[str, ExecutionModeOptions]] = None,
-    ):
-        self.layers = []
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
-        self.batch_size = batch_size
-        self.seq_len = seq_len
-        overrides = layer_mode_overrides or {}
-        
-        def get_mode(name):
-            return overrides.get(name, enclave_mode)
-        
-        # Flatten tokens for Linear layers: (batch_size * seq_len, embed_dim)
-        self.tokens = batch_size * seq_len
-        
-        # Q projection
-        self.q_proj = SGXLinearBase(
-            sid, f"{name_prefix}_q_proj", get_mode(f"{name_prefix}_q_proj"),
-            batch_size=self.tokens,
-            n_output_features=embed_dim,
-            n_input_features=embed_dim,
-            manually_register_prev=True, manually_register_next=True
-        )
-        
-        # K projection
-        self.k_proj = SGXLinearBase(
-            sid, f"{name_prefix}_k_proj", get_mode(f"{name_prefix}_k_proj"),
-            batch_size=self.tokens,
-            n_output_features=embed_dim,
-            n_input_features=embed_dim,
-            manually_register_prev=True, manually_register_next=True
-        )
-        
-        # V projection
-        self.v_proj = SGXLinearBase(
-            sid, f"{name_prefix}_v_proj", get_mode(f"{name_prefix}_v_proj"),
-            batch_size=self.tokens,
-            n_output_features=embed_dim,
-            n_input_features=embed_dim,
-            manually_register_prev=True, manually_register_next=True
-        )
-        self.layers.extend([self.q_proj, self.k_proj, self.v_proj])
-        
-        # Reshape Q: (tokens, embed_dim) -> (B, H, seq_len, head_dim)
-        self.reshape_q = SecretReshapeLayer(
-            sid, f"{name_prefix}_reshape_q", get_mode(f"{name_prefix}_reshape_q"),
-            target_shape=[batch_size, seq_len, num_heads, self.head_dim],
-            permute_dims=[0, 2, 1, 3],  # (B, H, seq_len, head_dim)
-            mode='view_permute',
-            manually_register_prev=True, manually_register_next=True
-        )
-        self.layers.append(self.reshape_q)
-        
-        # Reshape K
-        self.reshape_k = SecretReshapeLayer(
-            sid, f"{name_prefix}_reshape_k", get_mode(f"{name_prefix}_reshape_k"),
-            target_shape=[batch_size, seq_len, num_heads, self.head_dim],
-            permute_dims=[0, 2, 1, 3],
-            mode='view_permute',
-            manually_register_prev=True, manually_register_next=True
-        )
-        self.layers.append(self.reshape_k)
-        
-        # Reshape V
-        self.reshape_v = SecretReshapeLayer(
-            sid, f"{name_prefix}_reshape_v", get_mode(f"{name_prefix}_reshape_v"),
-            target_shape=[batch_size, seq_len, num_heads, self.head_dim],
-            permute_dims=[0, 2, 1, 3],
-            mode='view_permute',
-            manually_register_prev=True, manually_register_next=True
-        )
-        self.layers.append(self.reshape_v)
-        
-        # Q @ K^T with scaling
-        self.qk_matmul = SecretMatMulLayer(
-            sid, f"{name_prefix}_qk_matmul", get_mode(f"{name_prefix}_qk_matmul"),
-            transpose_b=True,
-            scale=1.0 / math.sqrt(self.head_dim),
-            manually_register_prev=True, manually_register_next=True
-        )
-        self.layers.append(self.qk_matmul)
-        
-        # Softmax
-        self.attn_softmax = SecretSoftmaxLayer(
-            sid, f"{name_prefix}_attn_softmax", get_mode(f"{name_prefix}_attn_softmax"),
-            dim=-1,
-            manually_register_prev=True, manually_register_next=True
-        )
-        self.layers.append(self.attn_softmax)
-        
-        # Attention @ V
-        self.attn_v_matmul = SecretMatMulLayer(
-            sid, f"{name_prefix}_attn_v_matmul", get_mode(f"{name_prefix}_attn_v_matmul"),
-            transpose_b=False,
-            manually_register_prev=True, manually_register_next=True
-        )
-        self.layers.append(self.attn_v_matmul)
-        
-        # Reshape back: (B, H, seq_len, head_dim) -> (B, seq_len, embed_dim)
-        self.reshape_concat = SecretReshapeLayer(
-            sid, f"{name_prefix}_reshape_concat", get_mode(f"{name_prefix}_reshape_concat"),
-            target_shape=[batch_size, num_heads, seq_len, self.head_dim],
-            permute_dims=[0, 2, 1, 3],  # (B, seq_len, H, head_dim)
-            mode='view_permute',
-            manually_register_prev=True, manually_register_next=True
-        )
-        self.layers.append(self.reshape_concat)
-        
-        # Flatten heads
-        self.flatten_heads = SecretReshapeLayer(
-            sid, f"{name_prefix}_flatten_heads", get_mode(f"{name_prefix}_flatten_heads"),
-            target_shape=[batch_size * seq_len, embed_dim],
-            mode='view',
-            manually_register_prev=True, manually_register_next=True
-        )
-        self.layers.append(self.flatten_heads)
-        
-        # Output projection
-        self.out_proj = SGXLinearBase(
-            sid, f"{name_prefix}_out_proj", get_mode(f"{name_prefix}_out_proj"),
-            batch_size=self.tokens,
-            n_output_features=embed_dim,
-            n_input_features=embed_dim,
-            manually_register_prev=True, manually_register_next=True
-        )
-        self.layers.append(self.out_proj)
-        
-        self.input_layer = self.q_proj
-        self.output_layer = self.out_proj
-    
-    def connect(self, prev_layer):
-        """Connect attention module to previous layer."""
-        # Q/K/V projections connect to input
-        self.q_proj.register_prev_layer(prev_layer)
-        self.k_proj.register_prev_layer(prev_layer)
-        self.v_proj.register_prev_layer(prev_layer)
-        
-        # Reshape each projection
-        self.reshape_q.register_prev_layer(self.q_proj)
-        self.reshape_k.register_prev_layer(self.k_proj)
-        self.reshape_v.register_prev_layer(self.v_proj)
-        
-        # Q @ K^T
-        self.qk_matmul.register_prev_layer(self.reshape_q)
-        self.qk_matmul.register_prev_layer(self.reshape_k)
-        
-        # Softmax
-        self.attn_softmax.register_prev_layer(self.qk_matmul)
-        
-        # Attention @ V
-        self.attn_v_matmul.register_prev_layer(self.attn_softmax)
-        self.attn_v_matmul.register_prev_layer(self.reshape_v)
-        
-        # Reshape back
-        self.reshape_concat.register_prev_layer(self.attn_v_matmul)
-        self.flatten_heads.register_prev_layer(self.reshape_concat)
-        
-        # Output projection
-        self.out_proj.register_prev_layer(self.flatten_heads)
-        
-        return self.out_proj
+# Note: MultiHeadSelfAttention class is now replaced by the unified
+# create_multi_head_attention factory from python.layers.attention
 
 
 class FFN:
@@ -310,6 +129,7 @@ class BERTEncoderBlock:
         batch_size: int = 1,
         seq_len: int = 128,
         layer_mode_overrides: Optional[Dict[str, ExecutionModeOptions]] = None,
+        use_per_head_attention: bool = False,
     ):
         self.layers = []
         overrides = layer_mode_overrides or {}
@@ -317,14 +137,19 @@ class BERTEncoderBlock:
         def get_mode(name):
             return overrides.get(name, enclave_mode)
         
-        # Multi-Head Self-Attention
-        self.attn = MultiHeadSelfAttention(
-            sid, f"{name_prefix}_attn", enclave_mode,
-            embed_dim=embed_dim, num_heads=num_heads,
-            batch_size=batch_size, seq_len=seq_len,
+        # Multi-Head Self-Attention (using unified factory)
+        self.attn = create_multi_head_attention(
+            sid=sid,
+            name_prefix=f"{name_prefix}_attn",
+            enclave_mode=enclave_mode,
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            per_head_mode=use_per_head_attention,
             layer_mode_overrides=overrides
         )
-        self.layers.extend(self.attn.layers)
+        self.layers.extend(self.attn.get_all_layers())
         
         # Residual 1 (input + attn output)
         self.residual1 = SecretAddLayer(
@@ -370,12 +195,12 @@ class BERTEncoderBlock:
     
     def connect(self, prev_layer):
         """Connect encoder block to previous layer."""
-        # Attention
-        self.attn.connect(prev_layer)
+        # Attention (using unified interface)
+        attn_output = self.attn.connect(prev_layer)
         
         # Residual1: input + attention output
         self.residual1.register_prev_layer(prev_layer)  # Skip connection
-        self.residual1.register_prev_layer(self.attn.output_layer)
+        self.residual1.register_prev_layer(attn_output)
         
         # LayerNorm 1
         self.norm1.register_prev_layer(self.residual1)
@@ -421,6 +246,7 @@ class SGXBERTBase:
         num_layers: int = 12,
         intermediate_size: int = 3072,
         layer_mode_overrides: Optional[Dict[str, ExecutionModeOptions]] = None,
+        use_per_head_attention: bool = False,
     ):
         self.sid = sid
         self.num_classes = num_classes
@@ -432,6 +258,7 @@ class SGXBERTBase:
         self.num_layers = num_layers
         self.intermediate_size = intermediate_size
         self.layer_mode_overrides = layer_mode_overrides or {}
+        self.use_per_head_attention = use_per_head_attention
         
         self.layers: List = []
         self.model_name = f"BERT-{embed_dim}"
@@ -469,7 +296,8 @@ class SGXBERTBase:
                 intermediate_size=self.intermediate_size,
                 batch_size=self.batch_size,
                 seq_len=self.seq_len,
-                layer_mode_overrides=self.layer_mode_overrides
+                layer_mode_overrides=self.layer_mode_overrides,
+                use_per_head_attention=self.use_per_head_attention
             )
             current_output = block.connect(current_output)
             self.layers.extend(block.layers)

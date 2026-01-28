@@ -45,6 +45,21 @@ from python.layers.matmul import SecretMatMulLayer
 from python.layers.scale import SecretScaleLayer
 from python.layers.reshape import SecretReshapeLayer
 
+# Vision Transformer-specific layers
+from python.layers.cls_token import SecretCLSTokenLayer
+from python.layers.position_embedding import SecretPositionEmbeddingLayer
+from python.layers.slice import SecretSliceLayer
+
+# Video Swin Transformer 3D layers
+from python.layers.sgx_conv3d_base import SGXConv3DBase
+from python.layers.window_partition_3d import SecretWindowPartition3DLayer
+from python.layers.window_reverse_3d import SecretWindowReverse3DLayer
+from python.layers.cyclic_roll_3d import SecretCyclicRoll3DLayer
+from python.layers.swin_window_attention_3d import (
+    SwinWindowAttention3D,
+    create_swin_window_attention_3d
+)
+
 __all__ = [
     # Base
     'SecretLayerBase',
@@ -56,6 +71,7 @@ __all__ = [
     # Linear
     'SGXLinearBase',
     'SGXConvBase',
+    'SGXConv3DBase',
     # Normalization
     'SecretBatchNorm1dLayer',
     'SecretBatchNorm2dLayer',
@@ -78,5 +94,15 @@ __all__ = [
     'SecretMatMulLayer',
     'SecretScaleLayer',
     'SecretReshapeLayer',
+    # Vision Transformer
+    'SecretCLSTokenLayer',
+    'SecretPositionEmbeddingLayer',
+    'SecretSliceLayer',
+    # Video Swin Transformer 3D
+    'SecretWindowPartition3DLayer',
+    'SecretWindowReverse3DLayer',
+    'SecretCyclicRoll3DLayer',
+    'SwinWindowAttention3D',
+    'create_swin_window_attention_3d',
 ]
 

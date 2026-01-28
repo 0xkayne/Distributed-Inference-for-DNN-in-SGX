@@ -1,24 +1,15 @@
+#!/usr/bin/env python
 """
-Vision Transformer (ViT) Performance Profiler for Distributed Inference Modeling.
+Vision Transformer (ViT) Enclave Performance Profiler.
 
-This script measures:
-1. Execution time of each layer in Enclave mode (with statistical analysis).
-2. Execution time of each layer in CPU mode.
-3. Input/Output tensor size of each layer (for communication cost modeling).
-4. Layer dependencies (for DAG construction).
+This script measures ViT layer execution in Enclave mode:
+- All layers (Conv, Linear, LayerNorm, Softmax, GELU, MatMul) run in Enclave
+- Supports both batched and per-head attention profiling modes
 
-Output: experiments/data/vit_base_layers.csv
+Usage:
+    LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6 python -m experiments.models.profile_vit_enclave
 
-Key Differences from Inception Profiler:
-- Transformer blocks have more uniform structure
-- New layer types: LayerNorm, Softmax, GELU, MatMul, Scale, Reshape
-- Sequence dimension instead of spatial dimensions
-- No pooling layers with special STORE_CHUNK_ELEM constraints
-
-ViT-Base Architecture Summary (12 blocks):
-- Patch Embedding: Conv2d(3, 768, 16x16, stride=16)
-- Each Block: LayerNorm -> MHSA -> Add -> LayerNorm -> FFN -> Add
-- Classification: LayerNorm -> Linear
+Output: experiments/data/vit_{variant}_enclave_layers.csv
 """
 
 import sys

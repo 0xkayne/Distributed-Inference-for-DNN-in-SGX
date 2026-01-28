@@ -109,6 +109,7 @@ class ALBERTEnclaveProfiler:
         num_classes: int = 2,
         num_iterations: int = 10,
         warmup_iterations: int = 3,
+        use_per_head_attention: bool = False,
     ):
         self.model_variant = model_variant
         self.batch_size = batch_size
@@ -116,6 +117,7 @@ class ALBERTEnclaveProfiler:
         self.num_classes = num_classes
         self.num_iterations = num_iterations
         self.warmup_iterations = warmup_iterations
+        self.use_per_head_attention = use_per_head_attention
         
         config = ALBERT_CONFIG[model_variant]
         self.embedding_dim = config['embedding_dim']
@@ -134,8 +136,8 @@ class ALBERTEnclaveProfiler:
         from python.enclave_interfaces import GlobalTensor
         
         # Reset interval: reset Enclave every N encoder blocks to prevent memory exhaustion
-        # Each encoder block creates ~12 layers, and EPC memory is limited
-        ENCLAVE_RESET_INTERVAL = 4
+        # Each encoder block creates ~12 layers (batched) or ~150 layers (per-head), and EPC memory is limited
+        ENCLAVE_RESET_INTERVAL = 1 if self.use_per_head_attention else 4
         
         if verbose:
             print(f"\n{'='*60}")
@@ -146,6 +148,7 @@ class ALBERTEnclaveProfiler:
             print(f"Note: ALBERT uses cross-layer parameter sharing!")
             print(f"Sequence: seq_len={self.seq_len}")
             print(f"Iterations: {self.num_iterations} (warmup: {self.warmup_iterations})")
+            print(f"Attention Mode: {'Per-Head (Fine-Grained)' if self.use_per_head_attention else 'Batched (Standard)'}")
             print(f"Enclave reset interval: every {ENCLAVE_RESET_INTERVAL} encoder blocks")
             print(f"{'='*60}\n")
         
@@ -163,7 +166,8 @@ class ALBERTEnclaveProfiler:
                     output_features=self.hidden_dim,
                     input_features=self.embedding_dim,
                     group='Embedding',
-                    verbose=verbose
+                    verbose=verbose,
+                    dependencies=[]
                 )
                 
                 # Profile all encoder blocks (shared parameters)
@@ -222,7 +226,14 @@ class ALBERTEnclaveProfiler:
             return self.metrics
     
     def _profile_encoder_block(self, block_idx: int, verbose: bool):
-        """Profile a single Encoder block - ALL layers in Enclave."""
+        """Profile a single Encoder block - dispatch to batched or per-head mode."""
+        if self.use_per_head_attention:
+            self._profile_encoder_block_per_head(block_idx, verbose)
+        else:
+            self._profile_encoder_block_batched(block_idx, verbose)
+    
+    def _profile_encoder_block_batched(self, block_idx: int, verbose: bool):
+        """Profile a single Encoder block - ALL layers in Enclave (batched mode)."""
         import torch
         
         prefix = f'encoder{block_idx}'
@@ -230,13 +241,20 @@ class ALBERTEnclaveProfiler:
         
         torch.set_num_threads(1)
         
+        # Determine previous block output
+        if block_idx == 0:
+            prev_block_output = 'embedding_projection'
+        else:
+            prev_block_output = f'encoder{block_idx-1}_norm2'
+        
         # ===== Q Projection (Enclave) =====
         self._profile_linear_enclave(
             f'{prefix}_attn_q_proj',
             input_shape=[self.batch_size, self.seq_len, self.hidden_dim],
             output_features=self.hidden_dim,
             group=group,
-            verbose=verbose
+            verbose=verbose,
+            dependencies=[prev_block_output]
         )
         
         # ===== K Projection (Enclave) =====
@@ -245,7 +263,8 @@ class ALBERTEnclaveProfiler:
             input_shape=[self.batch_size, self.seq_len, self.hidden_dim],
             output_features=self.hidden_dim,
             group=group,
-            verbose=verbose
+            verbose=verbose,
+            dependencies=[prev_block_output]
         )
         
         # ===== V Projection (Enclave) =====
@@ -254,7 +273,8 @@ class ALBERTEnclaveProfiler:
             input_shape=[self.batch_size, self.seq_len, self.hidden_dim],
             output_features=self.hidden_dim,
             group=group,
-            verbose=verbose
+            verbose=verbose,
+            dependencies=[prev_block_output]
         )
         
         # ===== QK MatMul (Enclave) =====
@@ -265,7 +285,8 @@ class ALBERTEnclaveProfiler:
             transpose_b=True,
             scale=1.0 / float(np.sqrt(self.head_dim)),
             group=group,
-            verbose=verbose
+            verbose=verbose,
+            dependencies=[f'{prefix}_attn_q_proj', f'{prefix}_attn_k_proj']
         )
         
         # ===== Softmax (Enclave) =====
@@ -273,7 +294,8 @@ class ALBERTEnclaveProfiler:
             f'{prefix}_attn_softmax',
             input_shape=[self.batch_size, self.num_heads, self.seq_len, self.seq_len],
             group=group,
-            verbose=verbose
+            verbose=verbose,
+            dependencies=[f'{prefix}_attn_qk_matmul']
         )
         
         # ===== Attention @ V MatMul (Enclave) =====
@@ -284,7 +306,8 @@ class ALBERTEnclaveProfiler:
             transpose_b=False,
             scale=None,
             group=group,
-            verbose=verbose
+            verbose=verbose,
+            dependencies=[f'{prefix}_attn_softmax', f'{prefix}_attn_v_proj']
         )
         
         # ===== Output Projection (Enclave) =====
@@ -293,7 +316,8 @@ class ALBERTEnclaveProfiler:
             input_shape=[self.batch_size, self.seq_len, self.hidden_dim],
             output_features=self.hidden_dim,
             group=group,
-            verbose=verbose
+            verbose=verbose,
+            dependencies=[f'{prefix}_attn_v_matmul']
         )
         
         # ===== LayerNorm 1 (post-norm after attention) =====
@@ -301,7 +325,8 @@ class ALBERTEnclaveProfiler:
             f'{prefix}_norm1',
             input_shape=[self.batch_size, self.seq_len, self.hidden_dim],
             group=group,
-            verbose=verbose
+            verbose=verbose,
+            dependencies=[f'{prefix}_attn_out_proj']
         )
         
         # ===== FFN FC1 (Enclave) =====
@@ -310,7 +335,8 @@ class ALBERTEnclaveProfiler:
             input_shape=[self.batch_size, self.seq_len, self.hidden_dim],
             output_features=self.intermediate_size,
             group=group,
-            verbose=verbose
+            verbose=verbose,
+            dependencies=[f'{prefix}_norm1']
         )
         
         # ===== GELU (Enclave) =====
@@ -318,7 +344,8 @@ class ALBERTEnclaveProfiler:
             f'{prefix}_ffn_gelu',
             input_shape=[self.batch_size, self.seq_len, self.intermediate_size],
             group=group,
-            verbose=verbose
+            verbose=verbose,
+            dependencies=[f'{prefix}_ffn_fc1']
         )
         
         # ===== FFN FC2 (Enclave) =====
@@ -327,7 +354,8 @@ class ALBERTEnclaveProfiler:
             input_shape=[self.batch_size, self.seq_len, self.intermediate_size],
             output_features=self.hidden_dim,
             group=group,
-            verbose=verbose
+            verbose=verbose,
+            dependencies=[f'{prefix}_ffn_gelu']
         )
         
         # ===== LayerNorm 2 (post-norm after FFN) =====
@@ -335,18 +363,167 @@ class ALBERTEnclaveProfiler:
             f'{prefix}_norm2',
             input_shape=[self.batch_size, self.seq_len, self.hidden_dim],
             group=group,
-            verbose=verbose
+            verbose=verbose,
+            dependencies=[f'{prefix}_ffn_fc2']
+        )
+    
+    def _profile_encoder_block_per_head(self, block_idx: int, verbose: bool):
+        """Profile a single Encoder block with per-head attention profiling."""
+        import torch
+        
+        prefix = f'encoder{block_idx}'
+        group = f'Encoder{block_idx}'
+        
+        torch.set_num_threads(1)
+        
+        # Determine previous block output
+        if block_idx == 0:
+            prev_block_output = 'embedding_projection'
+        else:
+            prev_block_output = f'encoder{block_idx-1}_norm2'
+        
+        # ===== Q/K/V Projections (Shared across heads) =====
+        self._profile_linear_enclave(
+            f'{prefix}_attn_q_proj',
+            input_shape=[self.batch_size, self.seq_len, self.hidden_dim],
+            output_features=self.hidden_dim,
+            group=group,
+            verbose=verbose,
+            dependencies=[prev_block_output]
+        )
+        
+        self._profile_linear_enclave(
+            f'{prefix}_attn_k_proj',
+            input_shape=[self.batch_size, self.seq_len, self.hidden_dim],
+            output_features=self.hidden_dim,
+            group=group,
+            verbose=verbose,
+            dependencies=[prev_block_output]
+        )
+        
+        self._profile_linear_enclave(
+            f'{prefix}_attn_v_proj',
+            input_shape=[self.batch_size, self.seq_len, self.hidden_dim],
+            output_features=self.hidden_dim,
+            group=group,
+            verbose=verbose,
+            dependencies=[prev_block_output]
+        )
+        
+        # ===== Per-Head Attention Computation =====
+        all_head_outputs = []
+        
+        for head_idx in range(self.num_heads):
+            head_prefix = f'{prefix}_attn_head{head_idx}'
+            head_group = f'{group}_Head{head_idx}'
+            
+            if verbose:
+                print(f"    --- Head {head_idx} ---")
+            
+            # QK MatMul for this head
+            self._profile_matmul_enclave(
+                f'{head_prefix}_qk_matmul',
+                input_shape1=[self.batch_size, 1, self.seq_len, self.head_dim],
+                input_shape2=[self.batch_size, 1, self.seq_len, self.head_dim],
+                transpose_b=True,
+                scale=1.0 / float(np.sqrt(self.head_dim)),
+                group=head_group,
+                verbose=verbose,
+                dependencies=[f'{prefix}_attn_q_proj', f'{prefix}_attn_k_proj']
+            )
+            
+            # Softmax for this head
+            self._profile_softmax_enclave(
+                f'{head_prefix}_softmax',
+                input_shape=[self.batch_size, 1, self.seq_len, self.seq_len],
+                group=head_group,
+                verbose=verbose,
+                dependencies=[f'{head_prefix}_qk_matmul']
+            )
+            
+            # Attention @ V for this head
+            self._profile_matmul_enclave(
+                f'{head_prefix}_attn_v_matmul',
+                input_shape1=[self.batch_size, 1, self.seq_len, self.seq_len],
+                input_shape2=[self.batch_size, 1, self.seq_len, self.head_dim],
+                transpose_b=False,
+                scale=None,
+                group=head_group,
+                verbose=verbose,
+                dependencies=[f'{head_prefix}_softmax', f'{prefix}_attn_v_proj']
+            )
+            
+            all_head_outputs.append(f'{head_prefix}_attn_v_matmul')
+        
+        # ===== Output Projection (Shared) =====
+        self._profile_linear_enclave(
+            f'{prefix}_attn_out_proj',
+            input_shape=[self.batch_size, self.seq_len, self.hidden_dim],
+            output_features=self.hidden_dim,
+            group=group,
+            verbose=verbose,
+            dependencies=all_head_outputs
+        )
+        
+        # ===== LayerNorm 1 (post-norm after attention) =====
+        self._profile_layernorm_enclave(
+            f'{prefix}_norm1',
+            input_shape=[self.batch_size, self.seq_len, self.hidden_dim],
+            group=group,
+            verbose=verbose,
+            dependencies=[f'{prefix}_attn_out_proj']
+        )
+        
+        # ===== FFN FC1 (Enclave) =====
+        self._profile_linear_enclave(
+            f'{prefix}_ffn_fc1',
+            input_shape=[self.batch_size, self.seq_len, self.hidden_dim],
+            output_features=self.intermediate_size,
+            group=group,
+            verbose=verbose,
+            dependencies=[f'{prefix}_norm1']
+        )
+        
+        # ===== GELU (Enclave) =====
+        self._profile_gelu_enclave(
+            f'{prefix}_ffn_gelu',
+            input_shape=[self.batch_size, self.seq_len, self.intermediate_size],
+            group=group,
+            verbose=verbose,
+            dependencies=[f'{prefix}_ffn_fc1']
+        )
+        
+        # ===== FFN FC2 (Enclave) =====
+        self._profile_linear_enclave(
+            f'{prefix}_ffn_fc2',
+            input_shape=[self.batch_size, self.seq_len, self.intermediate_size],
+            output_features=self.hidden_dim,
+            group=group,
+            verbose=verbose,
+            dependencies=[f'{prefix}_ffn_gelu']
+        )
+        
+        # ===== LayerNorm 2 (post-norm after FFN) =====
+        self._profile_layernorm_enclave(
+            f'{prefix}_norm2',
+            input_shape=[self.batch_size, self.seq_len, self.hidden_dim],
+            group=group,
+            verbose=verbose,
+            dependencies=[f'{prefix}_ffn_fc2']
         )
     
     def _profile_classifier_enclave(self, verbose: bool):
         """Profile classifier head in Enclave."""
+        last_encoder_output = f'encoder{self.num_layers-1}_norm2'
+        
         # Pooler (Enclave)
         self._profile_linear_enclave(
             'pooler',
             input_shape=[self.batch_size, self.hidden_dim],
             output_features=self.hidden_dim,
             group='ClassHead',
-            verbose=verbose
+            verbose=verbose,
+            dependencies=[last_encoder_output]
         )
         
         # Classifier (Enclave)
@@ -355,13 +532,15 @@ class ALBERTEnclaveProfiler:
             input_shape=[self.batch_size, self.hidden_dim],
             output_features=self.num_classes,
             group='ClassHead',
-            verbose=verbose
+            verbose=verbose,
+            dependencies=['pooler']
         )
     
     def _profile_linear_enclave(
         self, name: str, input_shape: List[int], 
         output_features: int, group: str, verbose: bool,
-        input_features: Optional[int] = None
+        input_features: Optional[int] = None,
+        dependencies: Optional[List[str]] = None
     ):
         """Profile a Linear layer in Enclave mode."""
         import torch
@@ -446,8 +625,9 @@ class ALBERTEnclaveProfiler:
                 output_shape=output_shape,
             )
             
-            # Infer dependencies
-            dependencies = infer_layer_dependencies(name, list(self.metrics.keys()) + [name])
+            # Use provided dependencies or infer them
+            if dependencies is None:
+                dependencies = infer_layer_dependencies(name, list(self.metrics.keys()) + [name])
             
             metrics = LayerMetrics(
                 name=name,
@@ -494,7 +674,8 @@ class ALBERTEnclaveProfiler:
     
     def _profile_layernorm_enclave(
         self, name: str, input_shape: List[int], 
-        group: str, verbose: bool
+        group: str, verbose: bool,
+        dependencies: Optional[List[str]] = None
     ):
         """Profile a LayerNorm layer in Enclave mode."""
         import torch
@@ -571,8 +752,9 @@ class ALBERTEnclaveProfiler:
                 output_shape=output_shape,
             )
             
-            # Infer dependencies
-            dependencies = infer_layer_dependencies(name, list(self.metrics.keys()) + [name])
+            # Use provided dependencies or infer them
+            if dependencies is None:
+                dependencies = infer_layer_dependencies(name, list(self.metrics.keys()) + [name])
             
             metrics = LayerMetrics(
                 name=name,
@@ -619,7 +801,8 @@ class ALBERTEnclaveProfiler:
     
     def _profile_softmax_enclave(
         self, name: str, input_shape: List[int], 
-        group: str, verbose: bool
+        group: str, verbose: bool,
+        dependencies: Optional[List[str]] = None
     ):
         """Profile a Softmax layer in Enclave mode."""
         import torch
@@ -694,8 +877,9 @@ class ALBERTEnclaveProfiler:
                 output_shape=output_shape,
             )
             
-            # Infer dependencies
-            dependencies = infer_layer_dependencies(name, list(self.metrics.keys()) + [name])
+            # Use provided dependencies or infer them
+            if dependencies is None:
+                dependencies = infer_layer_dependencies(name, list(self.metrics.keys()) + [name])
             
             metrics = LayerMetrics(
                 name=name,
@@ -742,7 +926,8 @@ class ALBERTEnclaveProfiler:
     
     def _profile_gelu_enclave(
         self, name: str, input_shape: List[int], 
-        group: str, verbose: bool
+        group: str, verbose: bool,
+        dependencies: Optional[List[str]] = None
     ):
         """Profile a GELU layer in Enclave mode."""
         import torch
@@ -817,8 +1002,9 @@ class ALBERTEnclaveProfiler:
                 output_shape=output_shape,
             )
             
-            # Infer dependencies
-            dependencies = infer_layer_dependencies(name, list(self.metrics.keys()) + [name])
+            # Use provided dependencies or infer them
+            if dependencies is None:
+                dependencies = infer_layer_dependencies(name, list(self.metrics.keys()) + [name])
             
             metrics = LayerMetrics(
                 name=name,
@@ -867,7 +1053,8 @@ class ALBERTEnclaveProfiler:
         self, name: str, 
         input_shape1: List[int], input_shape2: List[int],
         transpose_b: bool, scale: Optional[float],
-        group: str, verbose: bool
+        group: str, verbose: bool,
+        dependencies: Optional[List[str]] = None
     ):
         """Profile a MatMul layer in Enclave mode."""
         import torch
@@ -958,8 +1145,9 @@ class ALBERTEnclaveProfiler:
                 output_shape=output_shape,
             )
             
-            # Infer dependencies
-            dependencies = infer_layer_dependencies(name, list(self.metrics.keys()) + [name])
+            # Use provided dependencies or infer them
+            if dependencies is None:
+                dependencies = infer_layer_dependencies(name, list(self.metrics.keys()) + [name])
             
             metrics = LayerMetrics(
                 name=name,
@@ -1012,8 +1200,9 @@ class ALBERTEnclaveProfiler:
         os.makedirs(output_dir, exist_ok=True)
         
         variant = self.model_variant
-        csv_path = os.path.join(output_dir, f'albert_{variant}_enclave_layers.csv')
-        json_path = os.path.join(output_dir, f'albert_{variant}_enclave_layers.json')
+        suffix = '_per_head' if self.use_per_head_attention else ''
+        csv_path = os.path.join(output_dir, f'albert_{variant}_enclave{suffix}_layers.csv')
+        json_path = os.path.join(output_dir, f'albert_{variant}_enclave{suffix}_layers.json')
         
         fieldnames = [
             'name', 'type', 'group', 'execution_mode',
@@ -1062,6 +1251,7 @@ class ALBERTEnclaveProfiler:
                 'profiling_config': {
                     'num_iterations': self.num_iterations,
                     'warmup_iterations': self.warmup_iterations,
+                    'use_per_head_attention': self.use_per_head_attention,
                 },
                 'layers': [
                     dict(m.to_dict(), **{
@@ -1202,6 +1392,8 @@ def main():
                        help='Output directory for results')
     parser.add_argument('--quiet', action='store_true',
                        help='Suppress verbose output')
+    parser.add_argument('--per-head', action='store_true',
+                       help='Enable per-head attention profiling (fine-grained analysis)')
     
     args = parser.parse_args()
     
@@ -1213,6 +1405,7 @@ def main():
         seq_len=args.seq_len,
         num_iterations=args.iterations,
         warmup_iterations=args.warmup,
+        use_per_head_attention=args.per_head,
     )
     
     profiler.profile_all(verbose=not args.quiet)

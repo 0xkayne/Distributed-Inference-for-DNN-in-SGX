@@ -32,195 +32,15 @@ from python.layers.reshape import SecretReshapeLayer
 from python.layers.add import SecretAddLayer
 from python.layers.input import SecretInputLayer
 from python.layers.output import SecretOutputLayer
+from python.layers.cls_token import SecretCLSTokenLayer
+from python.layers.position_embedding import SecretPositionEmbeddingLayer
+from python.layers.slice import SecretSliceLayer
 from python.utils.basic_utils import ExecutionModeOptions
+from python.layers.attention import create_multi_head_attention
 
 
-class MultiHeadSelfAttention:
-    """
-    Multi-Head Self-Attention module.
-    
-    Structure:
-    - Input: (B, N, embed_dim) where N = num_patches + 1 (CLS token)
-    - QKV projection: Linear(embed_dim, 3*embed_dim) -> reshape to 3 tensors
-    - Attention: Q @ K^T / sqrt(d_k) -> Softmax -> @ V
-    - Output projection: Linear(embed_dim, embed_dim)
-    
-    For SGX, we decompose this into individual operations for profiling.
-    """
-    
-    def __init__(
-        self,
-        sid: int,
-        name_prefix: str,
-        enclave_mode: ExecutionModeOptions,
-        embed_dim: int,
-        num_heads: int,
-        batch_size: int = 1,
-        seq_len: int = 197,  # 196 patches + 1 CLS token
-        layer_mode_overrides: Optional[Dict[str, ExecutionModeOptions]] = None,
-    ):
-        self.layers = []
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
-        self.batch_size = batch_size
-        self.seq_len = seq_len
-        overrides = layer_mode_overrides or {}
-        
-        def get_mode(name):
-            return overrides.get(name, enclave_mode)
-        
-        # NOTE:
-        # SGXLinearBase is 2D: (batch_size, in_features) -> (batch_size, out_features).
-        # For ViT tokens, we represent the sequence as a flattened 2D matrix:
-        #   tokens = batch_size * seq_len
-        #   shape  = (tokens, embed_dim)
-        #
-        # We use separate Q/K/V projections (instead of a fused QKV) to keep
-        # reshape semantics valid without introducing a slice op here.
-        self.tokens = batch_size * seq_len
-        self.q_proj = SGXLinearBase(
-            sid, f"{name_prefix}_q_proj", get_mode(f"{name_prefix}_q_proj"),
-            batch_size=self.tokens,
-            n_output_features=embed_dim,
-            n_input_features=embed_dim,
-            manually_register_prev=True, manually_register_next=True
-        )
-        self.k_proj = SGXLinearBase(
-            sid, f"{name_prefix}_k_proj", get_mode(f"{name_prefix}_k_proj"),
-            batch_size=self.tokens,
-            n_output_features=embed_dim,
-            n_input_features=embed_dim,
-            manually_register_prev=True, manually_register_next=True
-        )
-        self.v_proj = SGXLinearBase(
-            sid, f"{name_prefix}_v_proj", get_mode(f"{name_prefix}_v_proj"),
-            batch_size=self.tokens,
-            n_output_features=embed_dim,
-            n_input_features=embed_dim,
-            manually_register_prev=True, manually_register_next=True
-        )
-        self.layers.extend([self.q_proj, self.k_proj, self.v_proj])
-        
-        # Reshape QKV: (B, N, 3*embed_dim) -> (3, B, num_heads, N, head_dim)
-        # We'll split this into Q, K, V reshapes for clarity
-        self.reshape_q = SecretReshapeLayer(
-            sid, f"{name_prefix}_reshape_q", get_mode(f"{name_prefix}_reshape_q"),
-            target_shape=[batch_size, seq_len, num_heads, self.head_dim],
-            permute_dims=[0, 2, 1, 3],  # (B, H, N, D)
-            mode='view_permute',
-            manually_register_prev=True, manually_register_next=True
-        )
-        self.layers.append(self.reshape_q)
-        
-        self.reshape_k = SecretReshapeLayer(
-            sid, f"{name_prefix}_reshape_k", get_mode(f"{name_prefix}_reshape_k"),
-            target_shape=[batch_size, seq_len, num_heads, self.head_dim],
-            permute_dims=[0, 2, 1, 3],  # (B, H, N, D)
-            mode='view_permute',
-            manually_register_prev=True, manually_register_next=True
-        )
-        self.layers.append(self.reshape_k)
-        
-        self.reshape_v = SecretReshapeLayer(
-            sid, f"{name_prefix}_reshape_v", get_mode(f"{name_prefix}_reshape_v"),
-            target_shape=[batch_size, seq_len, num_heads, self.head_dim],
-            permute_dims=[0, 2, 1, 3],  # (B, H, N, D)
-            mode='view_permute',
-            manually_register_prev=True, manually_register_next=True
-        )
-        self.layers.append(self.reshape_v)
-        
-        # Q @ K^T: (B, H, N, D) @ (B, H, D, N) -> (B, H, N, N)
-        self.qk_matmul = SecretMatMulLayer(
-            sid, f"{name_prefix}_qk_matmul", get_mode(f"{name_prefix}_qk_matmul"),
-            transpose_b=True,  # Transpose K
-            scale=1.0 / math.sqrt(self.head_dim),  # Scale by 1/sqrt(d_k)
-            manually_register_prev=True, manually_register_next=True
-        )
-        self.layers.append(self.qk_matmul)
-        
-        # Softmax: (B, H, N, N) -> (B, H, N, N)
-        self.attn_softmax = SecretSoftmaxLayer(
-            sid, f"{name_prefix}_attn_softmax", get_mode(f"{name_prefix}_attn_softmax"),
-            dim=-1,
-            manually_register_prev=True, manually_register_next=True
-        )
-        self.layers.append(self.attn_softmax)
-        
-        # Attention @ V: (B, H, N, N) @ (B, H, N, D) -> (B, H, N, D)
-        self.attn_v_matmul = SecretMatMulLayer(
-            sid, f"{name_prefix}_attn_v_matmul", get_mode(f"{name_prefix}_attn_v_matmul"),
-            transpose_b=False,
-            manually_register_prev=True, manually_register_next=True
-        )
-        self.layers.append(self.attn_v_matmul)
-        
-        # Reshape back: (B, H, N, D) -> (B, N, embed_dim)
-        self.reshape_concat = SecretReshapeLayer(
-            sid, f"{name_prefix}_reshape_concat", get_mode(f"{name_prefix}_reshape_concat"),
-            target_shape=[batch_size, num_heads, seq_len, self.head_dim],
-            permute_dims=[0, 2, 1, 3],  # (B, N, H, D)
-            mode='view_permute',
-            manually_register_prev=True, manually_register_next=True
-        )
-        self.layers.append(self.reshape_concat)
-        
-        # Flatten heads: (B, N, H, D) -> (B, N, embed_dim)
-        # We flatten to 2D (tokens, embed_dim) to be compatible with SGXLinearBase.
-        self.flatten_heads = SecretReshapeLayer(
-            sid, f"{name_prefix}_flatten_heads", get_mode(f"{name_prefix}_flatten_heads"),
-            target_shape=[batch_size * seq_len, embed_dim],
-            mode='view',
-            manually_register_prev=True, manually_register_next=True
-        )
-        self.layers.append(self.flatten_heads)
-        
-        # Output projection: (B, N, embed_dim) -> (B, N, embed_dim)
-        self.out_proj = SGXLinearBase(
-            sid, f"{name_prefix}_out_proj", get_mode(f"{name_prefix}_out_proj"),
-            batch_size=self.tokens,
-            n_output_features=embed_dim,
-            n_input_features=embed_dim,
-            manually_register_prev=True, manually_register_next=True
-        )
-        self.layers.append(self.out_proj)
-        
-        # Store key layers for connection
-        self.input_layer = self.q_proj
-        self.output_layer = self.out_proj
-    
-    def connect(self, prev_layer):
-        """Connect attention module to previous layer."""
-        # Q/K/V projections connect to input
-        self.q_proj.register_prev_layer(prev_layer)
-        self.k_proj.register_prev_layer(prev_layer)
-        self.v_proj.register_prev_layer(prev_layer)
-        
-        # Reshape each projection to (B, H, N, head_dim)
-        self.reshape_q.register_prev_layer(self.q_proj)
-        self.reshape_k.register_prev_layer(self.k_proj)
-        self.reshape_v.register_prev_layer(self.v_proj)
-        
-        # Q @ K^T
-        self.qk_matmul.register_prev_layer(self.reshape_q)
-        self.qk_matmul.register_prev_layer(self.reshape_k)
-        
-        # Softmax
-        self.attn_softmax.register_prev_layer(self.qk_matmul)
-        
-        # Attention @ V
-        self.attn_v_matmul.register_prev_layer(self.attn_softmax)
-        self.attn_v_matmul.register_prev_layer(self.reshape_v)
-        
-        # Reshape back
-        self.reshape_concat.register_prev_layer(self.attn_v_matmul)
-        self.flatten_heads.register_prev_layer(self.reshape_concat)
-        
-        # Output projection
-        self.out_proj.register_prev_layer(self.flatten_heads)
-        
-        return self.out_proj
+# Note: MultiHeadSelfAttention class has been replaced by the unified
+# create_multi_head_attention factory from python.layers.attention
 
 
 class FFN:
@@ -311,6 +131,7 @@ class TransformerBlock:
         batch_size: int = 1,
         seq_len: int = 197,
         layer_mode_overrides: Optional[Dict[str, ExecutionModeOptions]] = None,
+        use_per_head_attention: bool = False,
     ):
         self.layers = []
         overrides = layer_mode_overrides or {}
@@ -326,14 +147,19 @@ class TransformerBlock:
         )
         self.layers.append(self.norm1)
         
-        # Multi-Head Self-Attention
-        self.attn = MultiHeadSelfAttention(
-            sid, f"{name_prefix}_attn", enclave_mode,
-            embed_dim=embed_dim, num_heads=num_heads,
-            batch_size=batch_size, seq_len=seq_len,
+        # Multi-Head Self-Attention (using unified factory)
+        self.attn = create_multi_head_attention(
+            sid=sid,
+            name_prefix=f"{name_prefix}_attn",
+            enclave_mode=enclave_mode,
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            per_head_mode=use_per_head_attention,
             layer_mode_overrides=overrides
         )
-        self.layers.extend(self.attn.layers)
+        self.layers.extend(self.attn.get_all_layers())
         
         # Residual 1 (input + attn output)
         self.residual1 = SecretAddLayer(
@@ -373,11 +199,11 @@ class TransformerBlock:
         """Connect transformer block to previous layer."""
         # Norm1 -> Attention
         self.norm1.register_prev_layer(prev_layer)
-        self.attn.connect(self.norm1)
+        attn_output = self.attn.connect(self.norm1)
         
         # Residual1: input + attention output
         self.residual1.register_prev_layer(prev_layer)  # Skip connection
-        self.residual1.register_prev_layer(self.attn.output_layer)
+        self.residual1.register_prev_layer(attn_output)
         
         # Norm2 -> FFN
         self.norm2.register_prev_layer(self.residual1)
@@ -421,6 +247,7 @@ class SGXViTBase:
         num_layers: int = 12,
         mlp_ratio: float = 4.0,
         layer_mode_overrides: Optional[Dict[str, ExecutionModeOptions]] = None,
+        use_per_head_attention: bool = False,
     ):
         self.sid = sid
         self.num_classes = num_classes
@@ -433,6 +260,7 @@ class SGXViTBase:
         self.num_layers = num_layers
         self.mlp_ratio = mlp_ratio
         self.layer_mode_overrides = layer_mode_overrides or {}
+        self.use_per_head_attention = use_per_head_attention
         
         # Computed values
         self.num_patches = (img_size // patch_size) ** 2  # 196 for 224/16
@@ -477,11 +305,9 @@ class SGXViTBase:
 
         # Tokenize patches:
         # conv output: (B, embed_dim, H', W') where H'=W'=img_size/patch_size
-        # tokens:      (B*num_patches, embed_dim)
+        # tokens:      (B, num_patches, embed_dim)
         num_patches_hw = self.img_size // self.patch_size
         num_patches = num_patches_hw * num_patches_hw
-        # This native model omits CLS token; keep seq_len consistent with conv output.
-        self.seq_len = num_patches
 
         reshape_tokens_3d = SecretReshapeLayer(
             sid, "reshape_tokens_3d", self._get_mode("reshape_tokens_3d"),
@@ -493,13 +319,60 @@ class SGXViTBase:
         reshape_tokens_3d.register_prev_layer(patch_embed)
         self.layers.append(reshape_tokens_3d)
 
-        reshape_tokens_2d = SecretReshapeLayer(
-            sid, "reshape_tokens_2d", self._get_mode("reshape_tokens_2d"),
-            target_shape=[self.batch_size * num_patches, self.embed_dim],
+        # ========== CLS Token ==========
+        # Prepend learnable CLS token to patch tokens
+        cls_token_layer = SecretCLSTokenLayer(
+            sid, "cls_token", self._get_mode("cls_token"),
+            embed_dim=self.embed_dim,
+            batch_size=self.batch_size,
+            manually_register_prev=True, manually_register_next=True
+        )
+        cls_token_layer.register_prev_layer(reshape_tokens_3d)
+        self.layers.append(cls_token_layer)
+        
+        # Update seq_len to include CLS token
+        self.seq_len = num_patches + 1
+        
+        # Reshape to 2D for subsequent layers (B, N+1, D) -> (B*(N+1), D)
+        reshape_with_cls = SecretReshapeLayer(
+            sid, "reshape_with_cls", self._get_mode("reshape_with_cls"),
+            target_shape=[self.batch_size * self.seq_len, self.embed_dim],
             mode='view',
             manually_register_prev=True, manually_register_next=True
         )
-        reshape_tokens_2d.register_prev_layer(reshape_tokens_3d)
+        reshape_with_cls.register_prev_layer(cls_token_layer)
+        self.layers.append(reshape_with_cls)
+        
+        # ========== Position Embedding ==========
+        # Add learnable position embeddings
+        # First reshape back to 3D for position embedding
+        reshape_for_pos = SecretReshapeLayer(
+            sid, "reshape_for_pos", self._get_mode("reshape_for_pos"),
+            target_shape=[self.batch_size, self.seq_len, self.embed_dim],
+            mode='view',
+            manually_register_prev=True, manually_register_next=True
+        )
+        reshape_for_pos.register_prev_layer(reshape_with_cls)
+        self.layers.append(reshape_for_pos)
+        
+        pos_embed_layer = SecretPositionEmbeddingLayer(
+            sid, "pos_embed", self._get_mode("pos_embed"),
+            seq_len=self.seq_len,
+            embed_dim=self.embed_dim,
+            batch_size=self.batch_size,
+            manually_register_prev=True, manually_register_next=True
+        )
+        pos_embed_layer.register_prev_layer(reshape_for_pos)
+        self.layers.append(pos_embed_layer)
+        
+        # Reshape back to 2D for transformer blocks
+        reshape_tokens_2d = SecretReshapeLayer(
+            sid, "reshape_tokens_2d", self._get_mode("reshape_tokens_2d"),
+            target_shape=[self.batch_size * self.seq_len, self.embed_dim],
+            mode='view',
+            manually_register_prev=True, manually_register_next=True
+        )
+        reshape_tokens_2d.register_prev_layer(pos_embed_layer)
         self.layers.append(reshape_tokens_2d)
 
         current_output = reshape_tokens_2d
@@ -514,7 +387,8 @@ class SGXViTBase:
                 mlp_ratio=self.mlp_ratio,
                 batch_size=self.batch_size,
                 seq_len=self.seq_len,
-                layer_mode_overrides=self.layer_mode_overrides
+                layer_mode_overrides=self.layer_mode_overrides,
+                use_per_head_attention=self.use_per_head_attention
             )
             current_output = block.connect(current_output)
             self.layers.extend(block.layers)
@@ -529,18 +403,35 @@ class SGXViTBase:
         head_norm.register_prev_layer(current_output)
         self.layers.append(head_norm)
         
-        # Note: We only use the CLS token for classification
-        # This would require a slice operation, simplified here
+        # Reshape back to 3D to extract CLS token
+        reshape_3d_for_cls = SecretReshapeLayer(
+            sid, "reshape_3d_for_cls", self._get_mode("reshape_3d_for_cls"),
+            target_shape=[self.batch_size, self.seq_len, self.embed_dim],
+            mode='view',
+            manually_register_prev=True, manually_register_next=True
+        )
+        reshape_3d_for_cls.register_prev_layer(head_norm)
+        self.layers.append(reshape_3d_for_cls)
+        
+        # Extract CLS token (index 0) for classification
+        slice_cls = SecretSliceLayer(
+            sid, "slice_cls", self._get_mode("slice_cls"),
+            index=0, dim=1,
+            manually_register_prev=True, manually_register_next=True
+        )
+        slice_cls.register_prev_layer(reshape_3d_for_cls)
+        self.layers.append(slice_cls)
         
         # Classification Linear: (B, embed_dim) -> (B, num_classes)
+        # Now only classifies the CLS token, not all tokens
         classifier = SGXLinearBase(
             sid, "classifier", self._get_mode("classifier"),
-            batch_size=self.batch_size * self.seq_len,
+            batch_size=self.batch_size,  # Only batch dimension, not batch*seq
             n_output_features=self.num_classes,
             n_input_features=self.embed_dim,
             manually_register_prev=True, manually_register_next=True
         )
-        classifier.register_prev_layer(head_norm)
+        classifier.register_prev_layer(slice_cls)
         self.layers.append(classifier)
         
         # Output layer
@@ -601,6 +492,100 @@ class SGXViTBase:
             print(f"  - {layer_type}: {count}")
         print(f"\nTotal layers: {info['total_layers']}")
         print(f"{'='*60}\n")
+    
+    def inject_params_from_pytorch(self, pytorch_vit_model):
+        """
+        Inject parameters from a PyTorch Vision Transformer model.
+        
+        This method loads weights from a pretrained PyTorch ViT model into
+        the SGX-compatible layer structure.
+        
+        Args:
+            pytorch_vit_model: PyTorch ViT model (or compatible model with
+                              patch_embed, cls_token, pos_embed, blocks, etc.)
+        
+        Usage:
+            # Load pretrained PyTorch ViT
+            from torchvision.models import vit_b_16
+            pytorch_model = vit_b_16(pretrained=True)
+            
+            # Inject into SGX model
+            sgx_model = SGXViTBase(...)
+            sgx_model.inject_params_from_pytorch(pytorch_model)
+        """
+        print("Injecting parameters from PyTorch ViT model...")
+        
+        # Inject CLS token
+        cls_token_layer = self.get_layer_by_name("cls_token")
+        if cls_token_layer and hasattr(cls_token_layer, 'inject_params_from_pytorch'):
+            print("  - Injecting CLS token...")
+            cls_token_layer.inject_params_from_pytorch(pytorch_vit_model)
+        
+        # Inject position embeddings
+        pos_embed_layer = self.get_layer_by_name("pos_embed")
+        if pos_embed_layer and hasattr(pos_embed_layer, 'inject_params_from_pytorch'):
+            print("  - Injecting position embeddings...")
+            pos_embed_layer.inject_params_from_pytorch(pytorch_vit_model)
+        
+        # Inject patch embedding (Conv2d)
+        patch_embed_layer = self.get_layer_by_name("patch_embed")
+        if patch_embed_layer and hasattr(pytorch_vit_model, 'patch_embed'):
+            print("  - Injecting patch embedding...")
+            if hasattr(pytorch_vit_model.patch_embed, 'proj'):
+                # Standard ViT structure
+                patch_embed_layer.inject_params_from_pytorch(pytorch_vit_model.patch_embed.proj)
+            else:
+                patch_embed_layer.inject_params_from_pytorch(pytorch_vit_model.patch_embed)
+        
+        # Inject transformer blocks
+        if hasattr(pytorch_vit_model, 'blocks') or hasattr(pytorch_vit_model, 'encoder'):
+            blocks = pytorch_vit_model.blocks if hasattr(pytorch_vit_model, 'blocks') else pytorch_vit_model.encoder.layers
+            print(f"  - Injecting {len(blocks)} transformer blocks...")
+            
+            for i, pytorch_block in enumerate(blocks):
+                # Each block contains multiple layers (norm, attn, ffn, etc.)
+                # We need to match them with our SGX layers
+                block_prefix = f"block{i}"
+                
+                # Inject attention Q/K/V projections
+                for proj_name in ['q_proj', 'k_proj', 'v_proj', 'out_proj']:
+                    layer_name = f"{block_prefix}_attn_{proj_name}"
+                    layer = self.get_layer_by_name(layer_name)
+                    if layer and hasattr(pytorch_block, 'attn'):
+                        # Extract the corresponding weight from PyTorch attention
+                        if proj_name == 'out_proj' and hasattr(pytorch_block.attn, 'proj'):
+                            layer.inject_params_from_pytorch(pytorch_block.attn.proj)
+                        elif hasattr(pytorch_block.attn, proj_name):
+                            layer.inject_params_from_pytorch(getattr(pytorch_block.attn, proj_name))
+                
+                # Inject FFN layers
+                if hasattr(pytorch_block, 'mlp'):
+                    fc1_layer = self.get_layer_by_name(f"{block_prefix}_ffn_fc1")
+                    if fc1_layer and hasattr(pytorch_block.mlp, 'fc1'):
+                        fc1_layer.inject_params_from_pytorch(pytorch_block.mlp.fc1)
+                    
+                    fc2_layer = self.get_layer_by_name(f"{block_prefix}_ffn_fc2")
+                    if fc2_layer and hasattr(pytorch_block.mlp, 'fc2'):
+                        fc2_layer.inject_params_from_pytorch(pytorch_block.mlp.fc2)
+                
+                # Inject LayerNorms
+                for norm_idx in [1, 2]:
+                    norm_layer = self.get_layer_by_name(f"{block_prefix}_norm{norm_idx}")
+                    if norm_layer and hasattr(pytorch_block, f'norm{norm_idx}'):
+                        norm_layer.inject_params_from_pytorch(getattr(pytorch_block, f'norm{norm_idx}'))
+        
+        # Inject final norm and classifier
+        head_norm = self.get_layer_by_name("head_norm")
+        if head_norm and hasattr(pytorch_vit_model, 'norm'):
+            print("  - Injecting final LayerNorm...")
+            head_norm.inject_params_from_pytorch(pytorch_vit_model.norm)
+        
+        classifier_layer = self.get_layer_by_name("classifier")
+        if classifier_layer and hasattr(pytorch_vit_model, 'head'):
+            print("  - Injecting classifier head...")
+            classifier_layer.inject_params_from_pytorch(pytorch_vit_model.head)
+        
+        print("Parameter injection complete!")
 
 
 def create_vit_tiny(num_classes=1000, **kwargs):

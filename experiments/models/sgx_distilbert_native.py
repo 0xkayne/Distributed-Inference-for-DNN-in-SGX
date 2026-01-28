@@ -38,9 +38,14 @@ from python.layers.relu import SecretReLULayer
 from python.layers.input import SecretInputLayer
 from python.layers.output import SecretOutputLayer
 from python.utils.basic_utils import ExecutionModeOptions
+from python.layers.attention import create_multi_head_attention
 
 
-class MultiHeadSelfAttention:
+# Note: MultiHeadSelfAttention class is now replaced by the unified
+# create_multi_head_attention factory from python.layers.attention
+
+# Placeholder to maintain line structure
+class _RemovedMultiHeadSelfAttention:
     """
     Multi-Head Self-Attention module for DistilBERT.
     
@@ -316,14 +321,19 @@ class DistilBERTEncoderBlock:
         )
         self.layers.append(self.norm1)
         
-        # Multi-Head Self-Attention
-        self.attn = MultiHeadSelfAttention(
-            sid, f"{name_prefix}_attn", enclave_mode,
-            embed_dim=embed_dim, num_heads=num_heads,
-            batch_size=batch_size, seq_len=seq_len,
+        # Multi-Head Self-Attention (using unified factory)
+        self.attn = create_multi_head_attention(
+            sid=sid,
+            name_prefix=f"{name_prefix}_attn",
+            enclave_mode=enclave_mode,
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            per_head_mode=False,  # Will be parameterized
             layer_mode_overrides=overrides
         )
-        self.layers.extend(self.attn.layers)
+        self.layers.extend(self.attn.get_all_layers())
         
         # Residual 1
         self.residual1 = SecretAddLayer(
@@ -363,11 +373,11 @@ class DistilBERTEncoderBlock:
         """Connect encoder block to previous layer."""
         # Norm1 -> Attention
         self.norm1.register_prev_layer(prev_layer)
-        self.attn.connect(self.norm1)
+        attn_output = self.attn.connect(self.norm1)
         
         # Residual1: input + attention output
         self.residual1.register_prev_layer(prev_layer)
-        self.residual1.register_prev_layer(self.attn.output_layer)
+        self.residual1.register_prev_layer(attn_output)
         
         # Norm2 -> FFN
         self.norm2.register_prev_layer(self.residual1)
