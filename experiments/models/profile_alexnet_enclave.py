@@ -131,7 +131,6 @@ class AlexNetEnclaveProfiler:
         from python.enclave_interfaces import GlobalTensor
         from python.layers.sgx_conv_base import SGXConvBase
         from python.layers.input import SecretInputLayer
-        from python.layers.output import SecretOutputLayer
         
         sid = 0
         self._init_runtime_bucket(name)
@@ -151,17 +150,8 @@ class AlexNetEnclaveProfiler:
             batch_size=input_shape[0],
             img_hw=input_shape[2]
         )
-        out_layer = SecretOutputLayer(sid, f"{name}_out", ExecutionModeOptions.CPU)
         
         conv_layer.register_prev_layer(in_layer)
-        out_layer.register_prev_layer(conv_layer)
-        layers = [in_layer, conv_layer, out_layer]
-        
-        from python.sgx_net import SecretNeuralNetwork
-        sn = SecretNeuralNetwork(sid, name)
-        sn.set_eid(GlobalTensor.get_eid())
-        sn.set_layers(layers)
-        self._network_pool.append(sn)  # Prevent GC
         
         times = []
         for i in range(self.warmup_iterations + self.num_iterations):
@@ -195,7 +185,6 @@ class AlexNetEnclaveProfiler:
         from python.enclave_interfaces import GlobalTensor
         from python.layers.sgx_linear_base import SGXLinearBase
         from python.layers.input import SecretInputLayer
-        from python.layers.output import SecretOutputLayer
         
         sid = 0
         self._init_runtime_bucket(name)
@@ -205,16 +194,8 @@ class AlexNetEnclaveProfiler:
         fc_layer = SGXLinearBase(sid, name, ExecutionModeOptions.Enclave, 
                                batch_size=input_shape[0], n_output_features=out_features, 
                                n_input_features=input_shape[1])
-        out_layer = SecretOutputLayer(sid, f"{name}_out", ExecutionModeOptions.CPU)
         
         fc_layer.register_prev_layer(in_layer)
-        out_layer.register_prev_layer(fc_layer)
-        
-        from python.sgx_net import SecretNeuralNetwork
-        sn = SecretNeuralNetwork(sid, name)
-        sn.set_eid(GlobalTensor.get_eid())
-        sn.set_layers([in_layer, fc_layer, out_layer])
-        self._network_pool.append(sn)  # Prevent GC
         
         times = []
         for i in range(self.warmup_iterations + self.num_iterations):
