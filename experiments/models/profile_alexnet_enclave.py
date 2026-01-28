@@ -60,17 +60,21 @@ class AlexNetEnclaveProfiler:
         for k in ['get_ms', 'get2_ms', 'compute_ms', 'store_ms']:
             self._runtime_stats[name][k].append(stats.get(k, 0.0))
 
-    def _setup_layer(self, layer):
-        """Initialize layer with EID and setup shapes/linking/enclave."""
+    def _setup_layers(self, layers):
+        """Initialize layers with EID and setup shapes/linking/enclave in correct order."""
         from python.enclave_interfaces import GlobalTensor
-        # 1. Set Enclave ID (Critical: prevents 'Eid is None')
-        layer.set_eid(GlobalTensor.get_eid())
-        # 2. Initialize shapes (needed for weights/tensors)
-        layer.init_shape()
-        # 3. Link tensors (needed for shared memory opt)
-        layer.link_tensors()
-        # 4. Initialize layer (allocates memory, transfers weights)
-        layer.init(start_enclave=False)
+        eid = GlobalTensor.get_eid()
+        
+        # 1. Structure Phase: Set EID, Init Shapes, Link Tensors
+        # MUST link all tensors before any initialization (IsInitEnclaveTensor) occurs
+        for layer in layers:
+            layer.set_eid(eid)
+            layer.init_shape()
+            layer.link_tensors()
+            
+        # 2. Init Phase: Allocate Enclave Memory & Transfer Weights
+        for layer in layers:
+            layer.init(start_enclave=False)
 
     def profile_all(self, verbose: bool = True):
         from python.enclave_interfaces import GlobalTensor
@@ -173,8 +177,7 @@ class AlexNetEnclaveProfiler:
             self._layer_pool.extend([in_layer, conv_layer])
             
             # Setup layers (EID, init, etc.)
-            self._setup_layer(in_layer)
-            self._setup_layer(conv_layer)
+            self._setup_layers([in_layer, conv_layer])
             
             times = []
             for i in range(self.warmup_iterations + self.num_iterations):
@@ -232,8 +235,7 @@ class AlexNetEnclaveProfiler:
             self._layer_pool.extend([in_layer, fc_layer])
             
             # Setup layers (EID, init, etc.)
-            self._setup_layer(in_layer)
-            self._setup_layer(fc_layer)
+            self._setup_layers([in_layer, fc_layer])
             
             times = []
             for i in range(self.warmup_iterations + self.num_iterations):
@@ -286,8 +288,7 @@ class AlexNetEnclaveProfiler:
             self._layer_pool.extend([in_layer, relu_layer])
             
             # Setup layers (EID, init, etc.)
-            self._setup_layer(in_layer)
-            self._setup_layer(relu_layer)
+            self._setup_layers([in_layer, relu_layer])
             
             times = []
             for i in range(self.warmup_iterations + self.num_iterations):
@@ -339,8 +340,7 @@ class AlexNetEnclaveProfiler:
         self._layer_pool.extend([in_layer, pool_layer])
         
         # Setup layers (EID, init, etc.) - even CPU layers need init
-        self._setup_layer(in_layer)
-        self._setup_layer(pool_layer)
+        self._setup_layers([in_layer, pool_layer])
         
         times = []
         for i in range(self.warmup_iterations + self.num_iterations):
