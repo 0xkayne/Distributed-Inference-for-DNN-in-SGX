@@ -48,8 +48,8 @@ class AlexNetEnclaveProfiler:
         self.metrics: Dict[str, LayerMetrics] = OrderedDict()
         self.reuse_single_enclave: bool = True
         self._runtime_stats: Dict[str, Dict[str, List[float]]] = {}
-        # Keep network objects alive to prevent GC from destroying Enclave
-        self._network_pool: List[Any] = []
+        # Keep layer objects alive to prevent GC from destroying Enclave
+        self._layer_pool: List[Any] = []
 
     def _init_runtime_bucket(self, name: str):
         self._runtime_stats[name] = {
@@ -132,53 +132,64 @@ class AlexNetEnclaveProfiler:
         from python.layers.sgx_conv_base import SGXConvBase
         from python.layers.input import SecretInputLayer
         
-        sid = 0
-        self._init_runtime_bucket(name)
-        
-        # Calculate output shape
-        h_out = (input_shape[2] + 2*p - k) // s + 1
-        output_shape = [input_shape[0], out_channels, h_out, h_out]
-        
-        in_layer = SecretInputLayer(sid, f"{name}_in", input_shape, ExecutionModeOptions.Enclave)
-        conv_layer = SGXConvBase(
-            sid, name, ExecutionModeOptions.Enclave, 
-            n_output_channel=out_channels,
-            n_input_channel=input_shape[1],
-            filter_hw=k,
-            stride=s,
-            padding=p,
-            batch_size=input_shape[0],
-            img_hw=input_shape[2]
-        )
-        
-        conv_layer.register_prev_layer(in_layer)
-        
-        times = []
-        for i in range(self.warmup_iterations + self.num_iterations):
-            in_layer.set_input(torch.randn(*input_shape))
-            start = time.perf_counter()
-            in_layer.forward()
-            conv_layer.forward()
-            elapsed = (time.perf_counter() - start) * 1000
+        try:
+            if not GlobalTensor.is_init_global_tensor:
+                GlobalTensor.init()
             
-            stats = GlobalTensor.EnclaveInterface.get_layer_runtime_stats(conv_layer.LayerName)
-            if i >= self.warmup_iterations:
-                times.append(elapsed)
-                self._append_runtime_stats(name, stats)
+            sid = 0
+            self._init_runtime_bucket(name)
+            
+            # Calculate output shape
+            h_out = (input_shape[2] + 2*p - k) // s + 1
+            output_shape = [input_shape[0], out_channels, h_out, h_out]
+            
+            in_layer = SecretInputLayer(sid, f"{name}_in", input_shape, ExecutionModeOptions.Enclave)
+            conv_layer = SGXConvBase(
+                sid, name, ExecutionModeOptions.Enclave, 
+                n_output_channel=out_channels,
+                n_input_channel=input_shape[1],
+                filter_hw=k,
+                stride=s,
+                padding=p,
+                batch_size=input_shape[0],
+                img_hw=input_shape[2]
+            )
+            
+            conv_layer.register_prev_layer(in_layer)
+            
+            # Keep layers alive to prevent GC
+            self._layer_pool.extend([in_layer, conv_layer])
+            
+            times = []
+            for i in range(self.warmup_iterations + self.num_iterations):
+                in_layer.set_input(torch.randn(*input_shape))
+                start = time.perf_counter()
+                in_layer.forward()
+                conv_layer.forward()
+                elapsed = (time.perf_counter() - start) * 1000
+                
+                stats = GlobalTensor.EnclaveInterface.get_layer_runtime_stats(conv_layer.LayerName)
+                if i >= self.warmup_iterations:
+                    times.append(elapsed)
+                    self._append_runtime_stats(name, stats)
+            
+            mem = calc_layer_memory_from_shapes("Conv2d", input_shape, output_shape, kernel_size=k)
+            m = LayerMetrics(name, "Conv2d", group, "Enclave", 
+                            input_shape=input_shape, output_shape=output_shape,
+                            input_bytes=_shape_to_bytes(input_shape), output_bytes=_shape_to_bytes(output_shape),
+                            enclave_times=times, num_iterations=self.num_iterations,
+                            enclave_get_ms=self._runtime_stats[name]['get_ms'],
+                            enclave_get2_ms=self._runtime_stats[name]['get2_ms'],
+                            enclave_compute_ms=self._runtime_stats[name]['compute_ms'],
+                            enclave_store_ms=self._runtime_stats[name]['store_ms'],
+                            **mem)
+            m.compute_statistics()
+            self.metrics[name] = m
+            if verbose: print(f"  {name:20} {m.enclave_time_mean:8.3f} ms")
         
-        mem = calc_layer_memory_from_shapes("Conv2d", input_shape, output_shape, kernel_size=k)
-        m = LayerMetrics(name, "Conv2d", group, "Enclave", 
-                        input_shape=input_shape, output_shape=output_shape,
-                        input_bytes=_shape_to_bytes(input_shape), output_bytes=_shape_to_bytes(output_shape),
-                        enclave_times=times, num_iterations=self.num_iterations,
-                        enclave_get_ms=self._runtime_stats[name]['get_ms'],
-                        enclave_get2_ms=self._runtime_stats[name]['get2_ms'],
-                        enclave_compute_ms=self._runtime_stats[name]['compute_ms'],
-                        enclave_store_ms=self._runtime_stats[name]['store_ms'],
-                        **mem)
-        m.compute_statistics()
-        self.metrics[name] = m
-        if verbose: print(f"  {name:20} {m.enclave_time_mean:8.3f} ms")
+        finally:
+            if (not self.reuse_single_enclave) and GlobalTensor.is_init_global_tensor:
+                GlobalTensor.destroy()
 
     def _profile_linear_enclave(self, name, input_shape, out_features, group, verbose):
         import torch
@@ -186,43 +197,54 @@ class AlexNetEnclaveProfiler:
         from python.layers.sgx_linear_base import SGXLinearBase
         from python.layers.input import SecretInputLayer
         
-        sid = 0
-        self._init_runtime_bucket(name)
-        output_shape = [input_shape[0], out_features]
-        
-        in_layer = SecretInputLayer(sid, f"{name}_in", input_shape, ExecutionModeOptions.Enclave)
-        fc_layer = SGXLinearBase(sid, name, ExecutionModeOptions.Enclave, 
-                               batch_size=input_shape[0], n_output_features=out_features, 
-                               n_input_features=input_shape[1])
-        
-        fc_layer.register_prev_layer(in_layer)
-        
-        times = []
-        for i in range(self.warmup_iterations + self.num_iterations):
-            in_layer.set_input(torch.randn(*input_shape))
-            start = time.perf_counter()
-            in_layer.forward()
-            fc_layer.forward()
-            elapsed = (time.perf_counter() - start) * 1000
+        try:
+            if not GlobalTensor.is_init_global_tensor:
+                GlobalTensor.init()
             
-            stats = GlobalTensor.EnclaveInterface.get_layer_runtime_stats(fc_layer.LayerName)
-            if i >= self.warmup_iterations:
-                times.append(elapsed)
-                self._append_runtime_stats(name, stats)
+            sid = 0
+            self._init_runtime_bucket(name)
+            output_shape = [input_shape[0], out_features]
+            
+            in_layer = SecretInputLayer(sid, f"{name}_in", input_shape, ExecutionModeOptions.Enclave)
+            fc_layer = SGXLinearBase(sid, name, ExecutionModeOptions.Enclave, 
+                                   batch_size=input_shape[0], n_output_features=out_features, 
+                                   n_input_features=input_shape[1])
+            
+            fc_layer.register_prev_layer(in_layer)
+            
+            # Keep layers alive to prevent GC
+            self._layer_pool.extend([in_layer, fc_layer])
+            
+            times = []
+            for i in range(self.warmup_iterations + self.num_iterations):
+                in_layer.set_input(torch.randn(*input_shape))
+                start = time.perf_counter()
+                in_layer.forward()
+                fc_layer.forward()
+                elapsed = (time.perf_counter() - start) * 1000
+                
+                stats = GlobalTensor.EnclaveInterface.get_layer_runtime_stats(fc_layer.LayerName)
+                if i >= self.warmup_iterations:
+                    times.append(elapsed)
+                    self._append_runtime_stats(name, stats)
+            
+            mem = calc_layer_memory_from_shapes("Linear", input_shape, output_shape)
+            m = LayerMetrics(name, "Linear", group, "Enclave", 
+                            input_shape=input_shape, output_shape=output_shape,
+                            input_bytes=_shape_to_bytes(input_shape), output_bytes=_shape_to_bytes(output_shape),
+                            enclave_times=times, num_iterations=self.num_iterations,
+                            enclave_get_ms=self._runtime_stats[name]['get_ms'],
+                            enclave_get2_ms=self._runtime_stats[name]['get2_ms'],
+                            enclave_compute_ms=self._runtime_stats[name]['compute_ms'],
+                            enclave_store_ms=self._runtime_stats[name]['store_ms'],
+                            **mem)
+            m.compute_statistics()
+            self.metrics[name] = m
+            if verbose: print(f"  {name:20} {m.enclave_time_mean:8.3f} ms")
         
-        mem = calc_layer_memory_from_shapes("Linear", input_shape, output_shape)
-        m = LayerMetrics(name, "Linear", group, "Enclave", 
-                        input_shape=input_shape, output_shape=output_shape,
-                        input_bytes=_shape_to_bytes(input_shape), output_bytes=_shape_to_bytes(output_shape),
-                        enclave_times=times, num_iterations=self.num_iterations,
-                        enclave_get_ms=self._runtime_stats[name]['get_ms'],
-                        enclave_get2_ms=self._runtime_stats[name]['get2_ms'],
-                        enclave_compute_ms=self._runtime_stats[name]['compute_ms'],
-                        enclave_store_ms=self._runtime_stats[name]['store_ms'],
-                        **mem)
-        m.compute_statistics()
-        self.metrics[name] = m
-        if verbose: print(f"  {name:20} {m.enclave_time_mean:8.3f} ms")
+        finally:
+            if (not self.reuse_single_enclave) and GlobalTensor.is_init_global_tensor:
+                GlobalTensor.destroy()
 
     def _profile_relu_enclave(self, name, input_shape, group, verbose):
         import torch
@@ -230,38 +252,49 @@ class AlexNetEnclaveProfiler:
         from python.layers.relu import SecretReLULayer
         from python.layers.input import SecretInputLayer
         
-        sid = 0
-        self._init_runtime_bucket(name)
-        in_layer = SecretInputLayer(sid, f"{name}_in", input_shape, ExecutionModeOptions.Enclave)
-        relu_layer = SecretReLULayer(sid, name, ExecutionModeOptions.Enclave)
-        relu_layer.register_prev_layer(in_layer)
-        
-        times = []
-        for i in range(self.warmup_iterations + self.num_iterations):
-            in_layer.set_input(torch.randn(*input_shape))
-            start = time.perf_counter()
-            in_layer.forward()
-            relu_layer.forward()
-            elapsed = (time.perf_counter() - start) * 1000
+        try:
+            if not GlobalTensor.is_init_global_tensor:
+                GlobalTensor.init()
             
-            stats = GlobalTensor.EnclaveInterface.get_layer_runtime_stats(relu_layer.LayerName)
-            if i >= self.warmup_iterations:
-                times.append(elapsed)
-                self._append_runtime_stats(name, stats)
+            sid = 0
+            self._init_runtime_bucket(name)
+            in_layer = SecretInputLayer(sid, f"{name}_in", input_shape, ExecutionModeOptions.Enclave)
+            relu_layer = SecretReLULayer(sid, name, ExecutionModeOptions.Enclave)
+            relu_layer.register_prev_layer(in_layer)
+            
+            # Keep layers alive to prevent GC
+            self._layer_pool.extend([in_layer, relu_layer])
+            
+            times = []
+            for i in range(self.warmup_iterations + self.num_iterations):
+                in_layer.set_input(torch.randn(*input_shape))
+                start = time.perf_counter()
+                in_layer.forward()
+                relu_layer.forward()
+                elapsed = (time.perf_counter() - start) * 1000
+                
+                stats = GlobalTensor.EnclaveInterface.get_layer_runtime_stats(relu_layer.LayerName)
+                if i >= self.warmup_iterations:
+                    times.append(elapsed)
+                    self._append_runtime_stats(name, stats)
+            
+            mem = calc_layer_memory_from_shapes("ReLU", input_shape, input_shape)
+            m = LayerMetrics(name, "ReLU", group, "Enclave", 
+                            input_shape=input_shape, output_shape=input_shape,
+                            input_bytes=_shape_to_bytes(input_shape), output_bytes=_shape_to_bytes(input_shape),
+                            enclave_times=times, num_iterations=self.num_iterations,
+                            enclave_get_ms=self._runtime_stats[name]['get_ms'],
+                            enclave_get2_ms=self._runtime_stats[name]['get2_ms'],
+                            enclave_compute_ms=self._runtime_stats[name]['compute_ms'],
+                            enclave_store_ms=self._runtime_stats[name]['store_ms'],
+                            **mem)
+            m.compute_statistics()
+            self.metrics[name] = m
+            if verbose: print(f"  {name:20} {m.enclave_time_mean:8.3f} ms")
         
-        mem = calc_layer_memory_from_shapes("ReLU", input_shape, input_shape)
-        m = LayerMetrics(name, "ReLU", group, "Enclave", 
-                        input_shape=input_shape, output_shape=input_shape,
-                        input_bytes=_shape_to_bytes(input_shape), output_bytes=_shape_to_bytes(input_shape),
-                        enclave_times=times, num_iterations=self.num_iterations,
-                        enclave_get_ms=self._runtime_stats[name]['get_ms'],
-                        enclave_get2_ms=self._runtime_stats[name]['get2_ms'],
-                        enclave_compute_ms=self._runtime_stats[name]['compute_ms'],
-                        enclave_store_ms=self._runtime_stats[name]['store_ms'],
-                        **mem)
-        m.compute_statistics()
-        self.metrics[name] = m
-        if verbose: print(f"  {name:20} {m.enclave_time_mean:8.3f} ms")
+        finally:
+            if (not self.reuse_single_enclave) and GlobalTensor.is_init_global_tensor:
+                GlobalTensor.destroy()
 
     def _profile_maxpool_enclave(self, name, input_shape, k, s, p, group, verbose):
         import torch
@@ -277,6 +310,9 @@ class AlexNetEnclaveProfiler:
         in_layer = SecretInputLayer(sid, f"{name}_in", input_shape, ExecutionModeOptions.CPU) 
         pool_layer = SecretMaxpool2dLayer(sid, name, ExecutionModeOptions.CPU, filter_hw=k, stride=s, padding=p)
         pool_layer.register_prev_layer(in_layer)
+        
+        # Keep layers alive to prevent GC (even for CPU layers)
+        self._layer_pool.extend([in_layer, pool_layer])
         
         times = []
         for i in range(self.warmup_iterations + self.num_iterations):
