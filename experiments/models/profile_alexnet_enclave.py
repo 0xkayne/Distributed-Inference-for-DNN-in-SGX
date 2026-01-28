@@ -194,6 +194,11 @@ class AlexNetEnclaveProfiler:
             )
             
             return self.metrics
+        
+        finally:
+            # Cleanup: Destroy GlobalTensor if it was initialized
+            if GlobalTensor.is_init_global_tensor:
+                GlobalTensor.destroy()
 
     def save_results(self, output_file: str):
         """Save profiling results to CSV in aligned format."""
