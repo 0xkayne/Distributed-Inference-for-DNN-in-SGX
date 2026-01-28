@@ -8,6 +8,8 @@ import inspect
 import time
 from statistics import mean
 import sys
+from dataclasses import dataclass, field
+from typing import List, Optional, Dict, Any, Callable
 sys.path.insert(0, '.')
 
 from python.enclave_interfaces import GlobalTensor
@@ -22,53 +24,51 @@ from python.sgx_net import SecretNeuralNetwork
 from python.utils.basic_utils import ExecutionModeOptions
 
 
+@dataclass
+class AlexNetConfig:
+    """Configuration for AlexNet model."""
+    num_classes: int = 1000
+    batch_size: int = 1
+    input_size: int = 224
+    filter_counts: List[int] = field(default_factory=lambda: [96, 256, 384, 384, 256])
+    fc_dims: List[int] = field(default_factory=lambda: [4096, 4096])
+
+
 class SGXAlexNet:
     """
-    AlexNet Model
-
-    Architecture:
-    - Conv1: 11x11, 96 filters, stride 4, padding 2
-    - MaxPool: 3x3, stride 2
-    - Conv2: 5x5, 256 filters, padding 2
-    - MaxPool: 3x3, stride 2
-    - Conv3: 3x3, 384 filters, padding 1
-    - Conv4: 3x3, 384 filters, padding 1
-    - Conv5: 3x3, 256 filters, padding 1
-    - MaxPool: 3x3, stride 2
-    - FC1: 4096
-    - FC2: 4096
-    - FC3: num_classes
-
-    Total: 5 conv layers + 3 FC layers
+    AlexNet Model (2012 Paper Parameters)
+    Designed for SGX profiling and distributed inference.
     """
 
     def __init__(self, sid=0, num_classes=1000,
                  enclave_mode=ExecutionModeOptions.Enclave,
-                 batch_size=1, input_size=224):
-        """
-        Args:
-            sid: Session ID
-            num_classes: Number of output classes
-            enclave_mode: Execution mode (CPU/GPU/Enclave)
-            batch_size: Batch size
-            input_size: Input image size (224 for ImageNet)
-        """
+                 batch_size=1, input_size=224,
+                 config: Optional[AlexNetConfig] = None):
         self.sid = sid
-        self.num_classes = num_classes
+        self.config = config or AlexNetConfig(
+            num_classes=num_classes,
+            batch_size=batch_size,
+            input_size=input_size
+        )
+        self.num_classes = self.config.num_classes
         self.enclave_mode = enclave_mode
-        self.batch_size = batch_size
-        self.input_size = input_size
+        self.batch_size = self.config.batch_size
+        self.input_size = self.config.input_size
         self.input_shape = [self.batch_size, 3, self.input_size, self.input_size]
 
         self.layers = self._build_network()
         self.model_name = 'AlexNet'
+        self.layer_registry = []
+        self._build_layer_registry()
 
     def _build_network(self):
-        """Build AlexNet network layers"""
+        """Build AlexNet network layers (Matching 2012 Paper)"""
         layers = []
         sid = self.sid
         mode = self.enclave_mode
         pool_mode = ExecutionModeOptions.CPU if mode is ExecutionModeOptions.Enclave else mode
+        
+        filters = self.config.filter_counts
 
         # Input layer
         layers.append(SecretInputLayer(
@@ -78,7 +78,7 @@ class SGXAlexNet:
         # Conv1: 11x11, 96 filters, stride 4
         layers.append(SGXConvBase(
             sid, "conv1", mode,
-            n_output_channel=96,
+            n_output_channel=filters[0],
             n_input_channel=3,
             filter_hw=11,
             stride=4,
@@ -88,7 +88,7 @@ class SGXAlexNet:
         ))
         layers.append(SecretReLULayer(sid, "relu1", mode))
 
-        # MaxPool1: 3x3, stride 2 (CPU fallback in enclave mode)
+        # MaxPool1: 3x3, stride 2
         layers.append(SecretMaxpool2dLayer(
             sid, "pool1", pool_mode,
             filter_hw=3, stride=2, padding=0
@@ -97,7 +97,7 @@ class SGXAlexNet:
         # Conv2: 5x5, 256 filters
         layers.append(SGXConvBase(
             sid, "conv2", mode,
-            n_output_channel=256,
+            n_output_channel=filters[1],
             filter_hw=5,
             stride=1,
             padding=2
@@ -113,7 +113,7 @@ class SGXAlexNet:
         # Conv3: 3x3, 384 filters
         layers.append(SGXConvBase(
             sid, "conv3", mode,
-            n_output_channel=384,
+            n_output_channel=filters[2],
             filter_hw=3,
             stride=1,
             padding=1
@@ -123,7 +123,7 @@ class SGXAlexNet:
         # Conv4: 3x3, 384 filters
         layers.append(SGXConvBase(
             sid, "conv4", mode,
-            n_output_channel=384,
+            n_output_channel=filters[3],
             filter_hw=3,
             stride=1,
             padding=1
@@ -133,7 +133,7 @@ class SGXAlexNet:
         # Conv5: 3x3, 256 filters
         layers.append(SGXConvBase(
             sid, "conv5", mode,
-            n_output_channel=256,
+            n_output_channel=filters[4],
             filter_hw=3,
             stride=1,
             padding=1
@@ -149,20 +149,22 @@ class SGXAlexNet:
         # Flatten
         layers.append(SecretFlattenLayer(sid, "flatten", ExecutionModeOptions.CPU if mode is ExecutionModeOptions.Enclave else mode))
 
-        # FC layers (feature size after pooling: 6x6x256 = 9216)
+        # FC layers
+        # For 224x224 input, feature size after 3 poolings is 6x6x256 = 9216
+        fc_in_features = 6 * 6 * filters[4]
         layers.append(SGXLinearBase(
             sid, "fc1", mode,
             batch_size=self.batch_size,
-            n_output_features=4096,
-            n_input_features=6 * 6 * 256
+            n_output_features=self.config.fc_dims[0],
+            n_input_features=fc_in_features
         ))
         layers.append(SecretReLULayer(sid, "relu_fc1", mode))
 
         layers.append(SGXLinearBase(
             sid, "fc2", mode,
             batch_size=self.batch_size,
-            n_output_features=4096,
-            n_input_features=4096
+            n_output_features=self.config.fc_dims[1],
+            n_input_features=self.config.fc_dims[0]
         ))
         layers.append(SecretReLULayer(sid, "relu_fc2", mode))
 
@@ -170,13 +172,70 @@ class SGXAlexNet:
             sid, "fc3", mode,
             batch_size=self.batch_size,
             n_output_features=self.num_classes,
-            n_input_features=4096
+            n_input_features=self.config.fc_dims[1]
         ))
 
-        # Output layer (loss computed on CPU)
+        # Output layer
         layers.append(SecretOutputLayer(sid, "output", ExecutionModeOptions.CPU, self.num_classes))
 
         return layers
+
+    def _build_layer_registry(self):
+        """Build layer registry for profiling and distributed execution."""
+        self.layer_registry = []
+        for l in self.layers:
+            # Basic registry info
+            info = {
+                'name': l.LayerName if hasattr(l, 'LayerName') else str(l),
+                'module': l,
+                'type': type(l).__name__,
+            }
+            self.layer_registry.append(info)
+
+    def forward_layer_by_layer(self, input_tensor, layer_timing_callback: Optional[Callable[[str, float], None]] = None):
+        """Execute model layer by layer with timing callback."""
+        x = input_tensor
+        self.layers[0].set_input(x)
+        
+        for i, layer in enumerate(self.layers):
+            start = time.perf_counter()
+            layer.forward()
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            
+            name = layer.LayerName if hasattr(layer, 'LayerName') else f"layer_{i}"
+            if layer_timing_callback:
+                layer_timing_callback(name, elapsed_ms)
+        
+        # Last layer is output layer
+        return self.layers[-1].y
+
+    def get_memory_footprint(self) -> Dict[str, Any]:
+        """Estimate memory footprint for TEE execution planning."""
+        total_params_size = 0
+        total_act_size = 0
+        
+        # Approximate parameter counts (float32 = 4 bytes)
+        # Conv: out_ch * in_ch * k * k
+        # FC: out * in
+        filters = self.config.filter_counts
+        dims = self.config.fc_dims
+        
+        params = [
+            filters[0] * 3 * 11 * 11,
+            filters[1] * filters[0] * 5 * 5,
+            filters[2] * filters[1] * 3 * 3,
+            filters[3] * filters[2] * 3 * 3,
+            filters[4] * filters[3] * 3 * 3,
+            dims[0] * (6 * 6 * filters[4]),
+            dims[1] * dims[0],
+            self.num_classes * dims[1]
+        ]
+        total_params_size = sum(params) * 4
+        
+        return {
+            'parameters_mb': total_params_size / 1024 / 1024,
+            'config': self.config
+        }
 
     def __str__(self):
         info = f"SGXAlexNet Model\n"
