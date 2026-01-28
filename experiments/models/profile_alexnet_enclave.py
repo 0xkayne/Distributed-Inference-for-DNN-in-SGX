@@ -140,9 +140,16 @@ class AlexNetEnclaveProfiler:
         
         layers = []
         in_layer = SecretInputLayer(sid, f"{name}_in", input_shape, ExecutionModeOptions.Enclave)
-        conv_layer = SGXConvBase(sid, name, ExecutionModeOptions.Enclave, 
-                                out_channels, input_shape[1], k, s, p, 
-                                batch_size=input_shape[0], img_hw=input_shape[2])
+        conv_layer = SGXConvBase(
+            sid, name, ExecutionModeOptions.Enclave, 
+            n_output_channel=out_channels,
+            n_input_channel=input_shape[1],
+            filter_hw=k,
+            stride=s,
+            padding=p,
+            batch_size=input_shape[0],
+            img_hw=input_shape[2]
+        )
         out_layer = SecretOutputLayer(sid, f"{name}_out", ExecutionModeOptions.CPU)
         
         conv_layer.register_prev_layer(in_layer)
