@@ -34,7 +34,8 @@ public:
             // IdT der_input, IdT der_output, IdT der_weight, IdT der_bias,
             uint32_t batch_, uint32_t input_h_, uint32_t input_w_, uint32_t input_c_,
             uint32_t output_h_, uint32_t output_w_, uint32_t output_c_,
-            uint32_t kernel_, uint32_t padding_, uint32_t stride_);
+            uint32_t kernel_, uint32_t padding_, uint32_t stride_,
+            uint32_t groups_ = 1);
 
     // int get_num_batches_per_chunk(int num_elem_in_chunk) {
     //     return num_elem_in_chunk / input_size;
@@ -46,7 +47,7 @@ public:
     
     IdT FunId;
     int batch, input_h, input_w, input_c;
-    int output_h, output_w, output_c, kernel, padding, stride;
+    int output_h, output_w, output_c, kernel, padding, stride, groups;
 
     int input_row_size, one_batch_input_size, input_elem_fetch_per_chunk, 
         patch_size, max_im2col_patches_per_chunk, max_output_patches_per_chunk, 

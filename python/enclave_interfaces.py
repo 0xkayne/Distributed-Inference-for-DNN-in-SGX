@@ -299,7 +299,7 @@ class EnclaveInterface(object):
 
         self.lib.InitSGXLinear.argtypes = [self.EidT] + [self.IdT] * 5 + [c_uint32] * 3
         self.lib.SGXLinearForward.argtypes = [self.EidT, self.IdT]
-        self.lib.InitSGXConv.argtypes = [self.EidT] + [self.IdT] * 5 + [c_uint32] * 10
+        self.lib.InitSGXConv.argtypes = [self.EidT] + [self.IdT] * 5 + [c_uint32] * 11
         self.lib.SGXConvForward.argtypes = [self.EidT, self.IdT]
 
         # Transformer-specific layers
@@ -616,18 +616,19 @@ class EnclaveInterface(object):
         )
 
     def sgx_conv_init(
-        self, layer_name, 
+        self, layer_name,
         input_name, output_name, weight_name, bias_name,
         # der_input_name, der_output_name, der_weight_name, der_bias_name,
-        batch_size, input_h, input_w, input_c, output_h, output_w, output_c, 
+        batch_size, input_h, input_w, input_c, output_h, output_w, output_c,
         kernel, padding, stride,
+        groups=1,
     ):
         self.lib.InitSGXConv(
             self.get_eid(), self.get_tag(layer_name),
             self.get_tag(input_name), self.get_tag(output_name), self.get_tag(weight_name), self.get_tag(bias_name),
             # self.get_tag(der_input_name), self.get_tag(der_output_name), self.get_tag(der_weight_name), self.get_tag(der_bias_name),
             batch_size, input_h, input_w, input_c, output_h, output_w, output_c,
-            kernel, padding, stride,
+            kernel, padding, stride, groups,
         )
 
     def sgx_conv_forward(self, layer_name):

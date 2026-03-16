@@ -20,7 +20,7 @@ class SGXConvBase(SecretLayerBase):
     def __init__(
         self, sid, LayerName, EnclaveMode,
         n_output_channel, filter_hw, stride, padding, batch_size=None, n_input_channel=None,
-        img_hw=None, bias=True,
+        img_hw=None, bias=True, groups=1,
         is_enclave_mode=False, link_prev=True, link_next=True, manually_register_prev=False, manually_register_next=False
     ):
         super().__init__(sid, LayerName, EnclaveMode, link_prev, link_next, manually_register_prev, manually_register_next)
@@ -37,6 +37,7 @@ class SGXConvBase(SecretLayerBase):
         self.padding = padding
         self.stride = stride
         self.bias = bias
+        self.groups = groups
 
         if EnclaveMode is ExecutionModeOptions.CPU or EnclaveMode is ExecutionModeOptions.GPU:
             self.ForwardFunc = torch.nn.Conv2d
@@ -55,10 +56,10 @@ class SGXConvBase(SecretLayerBase):
         # st()
         # BHWC
         self.sgx_x_shape = [self.pytorch_x_shape[0], self.pytorch_x_shape[2], self.pytorch_x_shape[3], self.pytorch_x_shape[1]]
-        # pytorch weight is out * in * h * w
-        self.pytorch_w_shape = [self.n_output_channel, self.n_input_channel, self.filter_hw, self.filter_hw]
-        # w shape is in * w * h * out, the transpose of out * h * w * in
-        self.sgx_w_shape = [self.n_output_channel, self.filter_hw, self.filter_hw, self.n_input_channel]
+        # pytorch weight is out * in/groups * h * w
+        self.pytorch_w_shape = [self.n_output_channel, self.n_input_channel // self.groups, self.filter_hw, self.filter_hw]
+        # w shape is out * w * h * in/groups (TF format for enclave)
+        self.sgx_w_shape = [self.n_output_channel, self.filter_hw, self.filter_hw, self.n_input_channel // self.groups]
         # BCHW
         self.pytorch_y_shape = calc_conv2d_output_shape_stride(self.pytorch_x_shape, self.pytorch_w_shape, self.padding, self.stride)
         # BHWC
@@ -85,7 +86,7 @@ class SGXConvBase(SecretLayerBase):
         if self.EnclaveMode is ExecutionModeOptions.Enclave:
             self.PlainFunc = self.PlainFunc(
                 self.n_input_channel, self.n_output_channel, self.filter_hw,
-                self.stride, self.padding, bias=self.bias)
+                self.stride, self.padding, bias=self.bias, groups=self.groups)
             weight_pytorch_form = self.PlainFunc.weight.data
             weight_tf_form = self.weight_pytorch2tf(weight_pytorch_form)
             self.get_cpu("weight").data.copy_(weight_tf_form)
@@ -101,11 +102,11 @@ class SGXConvBase(SecretLayerBase):
                 self.LayerName,
                 "sgx_input", "sgx_output", "weight", "bias",
                 # "sgx_DerInput", "sgx_DerOutput", "DerWeight", "DerBias",
-                # "input", "output", "weight", 
-                # "DerInput", "DerOutput", "DerWeight", 
-                self.batch_size, self.img_hw, self.img_hw, self.n_input_channel, 
-                self.pytorch_y_shape[2], self.pytorch_y_shape[3], self.n_output_channel, 
-                self.filter_hw, self.padding, self.stride)
+                # "input", "output", "weight",
+                # "DerInput", "DerOutput", "DerWeight",
+                self.batch_size, self.img_hw, self.img_hw, self.n_input_channel,
+                self.pytorch_y_shape[2], self.pytorch_y_shape[3], self.n_output_channel,
+                self.filter_hw, self.padding, self.stride, self.groups)
         elif self.EnclaveMode in[ ExecutionModeOptions.CPU, ExecutionModeOptions.GPU]:
             self.ForwardFunc = self.ForwardFunc(
                 self.n_input_channel, self.n_output_channel, self.filter_hw,

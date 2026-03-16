@@ -669,9 +669,10 @@ extern "C"
             IdT FunId,
             IdT input, IdT output, IdT weight, IdT bias,
             // IdT der_input, IdT der_output, IdT der_weight, IdT der_bias,
-            uint32_t batch_, uint32_t input_h, uint32_t input_w, uint32_t input_c, 
+            uint32_t batch_, uint32_t input_h, uint32_t input_w, uint32_t input_c,
             uint32_t output_h, uint32_t output_w, uint32_t output_c,
-            uint32_t kernel, uint32_t padding, uint32_t stride
+            uint32_t kernel, uint32_t padding, uint32_t stride,
+            uint32_t groups
         ) {
 
         sgx_status_t ret = ecall_init_sgx_conv(
@@ -679,9 +680,9 @@ extern "C"
                 FunId,
                 input, output, weight, bias,
                 // der_input, der_output, der_weight, der_bias,
-                batch_, input_h, input_w, input_c, 
+                batch_, input_h, input_w, input_c,
                 output_h, output_w, output_c,
-                kernel, padding, stride);
+                kernel, padding, stride, groups);
         if (ret != SGX_SUCCESS) { print_error_message(ret, __func__); throw ret; }
     }
 

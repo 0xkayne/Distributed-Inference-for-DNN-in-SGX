@@ -112,19 +112,20 @@ void ecall_sgx_linear_forward(uint64_t FunId) {
 
 void ecall_init_sgx_conv(
         uint64_t FunId,
-        uint64_t input, uint64_t output, uint64_t weight, uint64_t bias, 
-        // uint64_t der_input, uint64_t der_output, uint64_t der_weight, uint64_t der_bias, 
-        uint32_t batch_, uint32_t input_h, uint32_t input_w, uint32_t input_c, 
+        uint64_t input, uint64_t output, uint64_t weight, uint64_t bias,
+        // uint64_t der_input, uint64_t der_output, uint64_t der_weight, uint64_t der_bias,
+        uint32_t batch_, uint32_t input_h, uint32_t input_w, uint32_t input_c,
         uint32_t output_h, uint32_t output_w, uint32_t output_c,
-        uint32_t kernel, uint32_t padding, uint32_t stride) {
+        uint32_t kernel, uint32_t padding, uint32_t stride,
+        uint32_t groups) {
 
     SecretInitSGXConv(
             FunId,
             input, output, weight, bias,
             // der_input, der_output, der_weight, der_bias,
-            batch_, input_h, input_w, input_c, 
+            batch_, input_h, input_w, input_c,
             output_h, output_w, output_c,
-            kernel, padding, stride);
+            kernel, padding, stride, groups);
 }
 
 void ecall_sgx_conv_forward(uint64_t FunId) {

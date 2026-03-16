@@ -61,9 +61,10 @@ extern "C" {
                 uint64_t FunId,
                 uint64_t input, uint64_t output, uint64_t weight, uint64_t bias,
                 // uint64_t der_input, uint64_t der_output, uint64_t der_weight, uint64_t der_bias,
-                uint32_t batch_, uint32_t input_h, uint32_t input_w, uint32_t input_c, 
+                uint32_t batch_, uint32_t input_h, uint32_t input_w, uint32_t input_c,
                 uint32_t output_h, uint32_t output_w, uint32_t output_c,
-                uint32_t kernel, uint32_t padding, uint32_t stride);
+                uint32_t kernel, uint32_t padding, uint32_t stride,
+                uint32_t groups);
         void SecretSGXConvForward(uint64_t FunId);
 
         // LayerNorm Layer

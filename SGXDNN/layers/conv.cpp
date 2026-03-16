@@ -33,7 +33,8 @@ void SGXConvBuffer::init(
         // IdT der_input, IdT der_output, IdT der_weight, IdT der_bias,
         uint32_t batch_, uint32_t input_h_, uint32_t input_w_, uint32_t input_c_,
         uint32_t output_h_, uint32_t output_w_, uint32_t output_c_,
-        uint32_t kernel_, uint32_t padding_, uint32_t stride_) {
+        uint32_t kernel_, uint32_t padding_, uint32_t stride_,
+        uint32_t groups_) {
     #ifdef PRINT_CONV_INIT_INFO
         printf("SGX Conv Buffer init\n", input);
     #endif
@@ -53,6 +54,7 @@ void SGXConvBuffer::init(
     input_h = input_h_; input_w = input_w_; input_c = input_c_;
     output_h = output_h_; output_w = output_w_; output_c = output_c_;
     kernel = kernel_; padding = padding_; stride = stride_;
+    groups = groups_;
 
     input_row_size = input_w * input_c; one_batch_input_size = input_h * input_row_size;
     if (STORE_CHUNK_ELEM % (input_row_size*stride) != 0){
@@ -132,10 +134,135 @@ void SGXConvBuffer::init(
 
 
 void SGXConvBuffer::forward() {
-    // printf(
-    //     "Secret Conv Forward, input (%d,%d,%d), output (%d,%d,%d), kernel %d, stride %d, padding %d\n",
-    //     input_h, input_w, input_c,  output_h, output_w, output_c, kernel, stride,  padding
-    // );
+    // Grouped convolution: split into groups, run standard conv per group,
+    // then concatenate outputs along the channel dimension.
+    if (groups > 1) {
+        auto& chunk_manager = TrustedChunkManager::getInstance();
+
+        int input_c_per_group = input_c / groups;
+        int output_c_per_group = output_c / groups;
+
+        // Allocate full input and output buffers
+        int input_total = batch * input_h * input_w * input_c;
+        int output_total = batch * output_h * output_w * output_c;
+        int weight_total = weight_tensor->GetNumElem();
+
+        DtypeForCpuOp* full_input = (DtypeForCpuOp*)malloc(input_total * sizeof(DtypeForCpuOp));
+        DtypeForCpuOp* full_output = (DtypeForCpuOp*)malloc(output_total * sizeof(DtypeForCpuOp));
+        DtypeForCpuOp* full_weight = (DtypeForCpuOp*)malloc(weight_total * sizeof(DtypeForCpuOp));
+        DtypeForCpuOp* full_bias = (DtypeForCpuOp*)malloc(output_c * sizeof(DtypeForCpuOp));
+
+        // Load all data from encrypted chunks
+        run_all_chunks([&](int start, int len) {
+            chunk_manager.GetChunk(input_tensor->GetChunkId(start), full_input + start, len * sizeof(DtypeForCpuOp));
+        }, STORE_CHUNK_ELEM, input_total);
+
+        run_all_chunks([&](int start, int len) {
+            chunk_manager.GetChunk(weight_tensor->GetChunkId(start), full_weight + start, len * sizeof(DtypeForCpuOp));
+        }, STORE_CHUNK_ELEM, weight_total);
+
+        chunk_manager.GetChunk(bias_tensor->GetChunkId(0), full_bias, output_c * sizeof(DtypeForCpuOp));
+
+        // Weight layout: [output_c, kernel, kernel, input_c] (TF format)
+        // For grouped conv, weight for group g:
+        //   filters [g*output_c_per_group .. (g+1)*output_c_per_group]
+        //   each filter has input_c_per_group channels (not input_c)
+        // But actual storage is [output_c, kernel, kernel, input_c/groups]
+        // since Python side already slices input_c for grouped conv weight
+
+        int patch_size_per_group = kernel * kernel * input_c_per_group;
+
+        // Process each group
+        for (int g = 0; g < groups; g++) {
+            int in_ch_start = g * input_c_per_group;
+            int out_ch_start = g * output_c_per_group;
+
+            // Extract group input: pick channels [in_ch_start, in_ch_start+input_c_per_group)
+            // Input layout: [B, H, W, C] (BHWC)
+            int spatial_total = batch * input_h * input_w;
+            DtypeForCpuOp* group_input = (DtypeForCpuOp*)malloc(spatial_total * input_c_per_group * sizeof(DtypeForCpuOp));
+            for (int s = 0; s < spatial_total; s++) {
+                memcpy(group_input + s * input_c_per_group,
+                       full_input + s * input_c + in_ch_start,
+                       input_c_per_group * sizeof(DtypeForCpuOp));
+            }
+
+            // Get group weight: [output_c_per_group, kernel, kernel, input_c_per_group]
+            DtypeForCpuOp* group_weight = full_weight + g * output_c_per_group * patch_size_per_group;
+            DtypeForCpuOp* group_bias = full_bias + out_ch_start;
+
+            // Im2col + MatMul for this group
+            int out_spatial = batch * output_h * output_w;
+            DtypeForCpuOp* group_output = (DtypeForCpuOp*)malloc(out_spatial * output_c_per_group * sizeof(DtypeForCpuOp));
+            DtypeForCpuOp* im2col_buf = (DtypeForCpuOp*)malloc(out_spatial * patch_size_per_group * sizeof(DtypeForCpuOp));
+
+            // Build im2col matrix
+            int filter_radius_h = kernel / 2;
+            int filter_radius_w = kernel / 2;
+            int im2col_row = 0;
+            for (int b = 0; b < batch; b++) {
+                for (int oh = 0; oh < output_h; oh++) {
+                    for (int ow = 0; ow < output_w; ow++) {
+                        DtypeForCpuOp* im2col_row_start = im2col_buf + im2col_row * patch_size_per_group;
+                        int in_y_origin = oh * stride - padding;
+                        int in_x_origin = ow * stride - padding;
+                        for (int fh = 0; fh < kernel; fh++) {
+                            int in_y = in_y_origin + fh;
+                            for (int fw = 0; fw < kernel; fw++) {
+                                int in_x = in_x_origin + fw;
+                                int patch_offset = (fh * kernel + fw) * input_c_per_group;
+                                if (in_y < 0 || in_y >= input_h || in_x < 0 || in_x >= input_w) {
+                                    memset(im2col_row_start + patch_offset, 0, input_c_per_group * sizeof(DtypeForCpuOp));
+                                } else {
+                                    int input_idx = (b * input_h * input_w + in_y * input_w + in_x) * input_c_per_group;
+                                    memcpy(im2col_row_start + patch_offset,
+                                           group_input + input_idx,
+                                           input_c_per_group * sizeof(DtypeForCpuOp));
+                                }
+                            }
+                        }
+                        im2col_row++;
+                    }
+                }
+            }
+
+            // MatMul: group_output[out_spatial, output_c_per_group] = im2col[out_spatial, patch_size] * weight^T[patch_size, output_c_per_group]
+            MapMatRowMajor im2col_mat(im2col_buf, out_spatial, patch_size_per_group);
+            MapMatRowMajor weight_mat(group_weight, output_c_per_group, patch_size_per_group);
+            MapMatRowMajor out_mat(group_output, out_spatial, output_c_per_group);
+            out_mat = im2col_mat * weight_mat.transpose();
+
+            // Add bias
+            MapMatRowMajor bias_vec(group_bias, 1, output_c_per_group);
+            for (int r = 0; r < out_spatial; r++) {
+                out_mat.row(r).array() += bias_vec.row(0).array();
+            }
+
+            // Scatter group output to full output (BHWC layout)
+            for (int s = 0; s < out_spatial; s++) {
+                memcpy(full_output + s * output_c + out_ch_start,
+                       group_output + s * output_c_per_group,
+                       output_c_per_group * sizeof(DtypeForCpuOp));
+            }
+
+            free(group_input);
+            free(group_output);
+            free(im2col_buf);
+        }
+
+        // Store output back to encrypted chunks
+        run_all_chunks([&](int start, int len) {
+            chunk_manager.StoreChunk(output_tensor->GetChunkId(start), full_output + start, len * sizeof(DtypeForCpuOp));
+        }, STORE_CHUNK_ELEM, output_total);
+
+        free(full_input);
+        free(full_output);
+        free(full_weight);
+        free(full_bias);
+        return;
+    }
+
+    // Original forward for groups == 1 follows below
     #ifdef PRINT_RUN_TIME_INFO
         sgx_time_t total_start = get_time();
     #endif
