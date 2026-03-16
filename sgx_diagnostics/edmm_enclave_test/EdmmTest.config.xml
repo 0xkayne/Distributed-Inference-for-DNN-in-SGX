@@ -1,0 +1,16 @@
+<EnclaveConfiguration>
+  <ProdID>0</ProdID>
+  <ISVSVN>0</ISVSVN>
+  <StackMaxSize>0x40000</StackMaxSize>          <!-- 256KB stack -->
+  <HeapMaxSize>0x100000</HeapMaxSize>           <!-- 1MB heap max -->
+  <HeapMinSize>0x1000</HeapMinSize>             <!-- 4KB heap initial (EDMM expands on demand) -->
+  <HeapInitSize>0x100000</HeapInitSize>         <!-- 1MB on non-EDMM systems -->
+  <TCSNum>1</TCSNum>
+  <TCSPolicy>1</TCSPolicy>
+  <DisableDebug>0</DisableDebug>
+  <!-- UserRegionSize: dedicated region for sgx_mm_alloc() EDMM operations -->
+  <UserRegionSize>0x100000</UserRegionSize>     <!-- 1MB user region for EDMM -->
+  <!-- EXINFO required for EDMM EACCEPT; MiscMask[0]=1 enforces it -->
+  <MiscSelect>1</MiscSelect>
+  <MiscMask>0xFFFFFFFF</MiscMask>
+</EnclaveConfiguration>

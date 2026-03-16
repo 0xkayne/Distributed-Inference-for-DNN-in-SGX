@@ -2,20 +2,26 @@
 <EnclaveConfiguration>
   <ProdID>0</ProdID>
   <ISVSVN>1</ISVSVN>
-  
+
   <!-- Stack Configuration (SGX2 EDMM) -->
   <StackMaxSize>0x2000000</StackMaxSize>        <!-- 32MB max stack -->
-  
-  <!-- Heap Configuration for EDMM - increased for dynamic allocation -->
-  <HeapMaxSize>0x80000000</HeapMaxSize>         <!-- 1GB max heap for EDMM -->
-  
+
+  <!-- Heap Configuration for EDMM -->
+  <!-- HeapMinSize: initial commit on EDMM systems (grows on demand to HeapMaxSize) -->
+  <!-- HeapInitSize: initial commit on non-EDMM systems -->
+  <HeapMaxSize>0x80000000</HeapMaxSize>         <!-- 2GB max heap -->
+  <HeapInitSize>0x80000000</HeapInitSize>       <!-- 2GB on non-EDMM (full commit) -->
+  <HeapMinSize>0x10000</HeapMinSize>            <!-- 64KB initial on EDMM (grows on demand) -->
+
   <!-- Thread Control Structure -->
   <TCSNum>4</TCSNum>
   <TCSPolicy>1</TCSPolicy>
   <DisableDebug>0</DisableDebug>
-  
-  <!-- Misc Select and Mask - for SGX2 EDMM features -->
-  <!-- Set MiscSelect[0]=1 and MiscMask[0]=0 to enable dynamic features -->
+
+  <!-- UserRegionSize: dedicated region for sgx_mm_alloc() EDMM operations -->
+  <UserRegionSize>0x100000</UserRegionSize>     <!-- 1MB user region for EDMM -->
+
+  <!-- EXINFO required for EDMM EACCEPT; MiscMask[0]=1 enforces it -->
   <MiscSelect>1</MiscSelect>
-  <MiscMask>0xFFFFFFFE</MiscMask>
+  <MiscMask>0xFFFFFFFF</MiscMask>
 </EnclaveConfiguration>

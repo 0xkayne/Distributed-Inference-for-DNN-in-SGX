@@ -1,0 +1,24 @@
+/* EdmmTest.edl — Minimal enclave interface for EDMM runtime verification */
+
+enclave {
+    from "sgx_tstdc.edl" import *;
+
+    trusted {
+        /* Test 1: Check if EDMM API headers are available at compile time */
+        public int ecall_check_edmm_api(void);
+
+        /* Test 2: Try sgx_alloc_rsrv_mem() — triggers EAUG on SGX2 hardware */
+        public int ecall_test_rsrv_alloc([out] uint64_t *allocated_addr,
+                                         [out] uint64_t *allocated_size);
+
+        /* Test 3: Try sgx_mm_alloc() with COMMIT_ON_DEMAND — requires SGX2 */
+        public int ecall_test_mm_alloc([out] uint64_t *allocated_addr,
+                                       [out] uint64_t *allocated_size);
+
+        /* Test 4: Get detailed EDMM runtime diagnostics */
+        public int ecall_get_edmm_diagnostics([out] uint64_t *edmm_flag,
+                                              [out] uint64_t *rsrv_base,
+                                              [out] uint64_t *rsrv_max_size,
+                                              [out] uint64_t *rsrv_info_ret);
+    };
+};
